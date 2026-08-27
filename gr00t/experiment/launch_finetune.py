@@ -100,7 +100,7 @@ if __name__ == "__main__":
     config.model.model_name = os.environ.get("VLM_MODEL_PATH", "nvidia/Cosmos-Reason2-2B")
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
-
+    config.training.enable_profiling = ft_config.enable_profiling
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path
     config.training.optim = "adamw_torch"

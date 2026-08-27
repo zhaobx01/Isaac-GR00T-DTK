@@ -25,13 +25,18 @@ from omegaconf import OmegaConf
 import torch
 import torch.distributed as dist
 from transformers import TrainingArguments, set_seed
+from transformers.trainer_callback import ProgressCallback
 from transformers.utils import is_torch_tf32_available
 
 from gr00t.configs.base_config import Config
 from gr00t.configs.training.training_config import check_resume_compatibility
 
 # Use custom trainer that profiles data loading & forward times
-from gr00t.experiment.trainer import Gr00tTrainer, ProfCallback
+from gr00t.experiment.trainer import (
+    Gr00tTrainer,
+    ProfCallback,
+    SamplesPerSecondProgressCallback,
+)
 from gr00t.experiment.utils import BestMetricCheckpointCallback, CheckpointFormatCallback
 from gr00t.model import MODEL_REGISTRY
 from gr00t.utils.dist_utils import run_on_rank0, run_or_wait_on_rank0
@@ -316,6 +321,8 @@ def run(config: Config):
         data_collator=data_collator,
         multiprocessing_context=config.data.multiprocessing_context,
     )
+    trainer.remove_callback(ProgressCallback)
+    trainer.add_callback(SamplesPerSecondProgressCallback())
 
     trainer.add_callback(
         CheckpointFormatCallback(
@@ -360,7 +367,7 @@ def run(config: Config):
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            schedule=torch.profiler.schedule(skip_first=10, wait=1, warmup=1, active=3, repeat=1),
+            schedule=torch.profiler.schedule(skip_first=1, wait=1, warmup=5, active=1, repeat=1),
             # profile_memory=True,
             with_stack=True,
             # record_shapes=True,

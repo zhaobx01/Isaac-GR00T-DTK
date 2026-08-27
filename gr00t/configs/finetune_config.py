@@ -169,6 +169,9 @@ class FinetuneConfig:
     warmup_ratio: float = 0.05
     """Proportion of total training steps used for learning rate warm-up."""
 
+    enable_profiling: bool = False
+    """Capture a PyTorch profiler trace during training."""
+
     ds_weights_alpha: float | None = None
     """Power-law exponent for dataset soup weighting. When set, each dataset's
     sampling weight is len(dataset)^alpha and per-dataset mix_ratio values are ignored."""

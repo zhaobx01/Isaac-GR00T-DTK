@@ -33,11 +33,35 @@ import logging
 import os
 import queue
 import threading
+import time
 from typing import Any, Optional
 
 import torch
 from transformers.trainer import TRAINER_STATE_NAME, Trainer, TrainerState, get_last_checkpoint
-from transformers.trainer_callback import TrainerCallback
+from transformers.trainer_callback import ProgressCallback, TrainerCallback
+
+
+class SamplesPerSecondProgressCallback(ProgressCallback):
+    """Show global training throughput alongside the tqdm step rate."""
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        super().on_train_begin(args, state, control, **kwargs)
+        self._last_step_time = time.perf_counter()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        now = time.perf_counter()
+        step_delta = state.global_step - self.current_step
+        elapsed = now - self._last_step_time
+
+        if state.is_world_process_zero and step_delta > 0 and elapsed > 0:
+            samples_per_step = (
+                args.train_batch_size * args.gradient_accumulation_steps * args.world_size
+            )
+            samples_per_second = samples_per_step * step_delta / elapsed
+            self.training_bar.set_postfix_str(f"{samples_per_second:.2f} sample/s", refresh=False)
+
+        super().on_step_end(args, state, control, **kwargs)
+        self._last_step_time = now
 
 
 class ProfCallback(TrainerCallback):
