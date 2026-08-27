@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -72,6 +73,33 @@ def get_frames_by_indices(
     indices: list[int] | np.ndarray,
     decoder_kwargs: Optional[dict] = None,
 ) -> np.ndarray:
+    if os.environ.get("VIDEO_DECODER_BACKEND") == "opencv":
+        import cv2
+
+        requested = np.asarray(indices, dtype=np.int64)
+        if requested.size == 0:
+            return np.empty((0, 0, 0, 3), dtype=np.uint8)
+        if np.any(requested < 0):
+            raise ValueError(f"Frame indices must be non-negative: {requested.tolist()}")
+
+        capture = cv2.VideoCapture(video_path)
+        if not capture.isOpened():
+            raise RuntimeError(f"Could not open video with OpenCV: {video_path}")
+        frames_by_index = {}
+        wanted = set(requested.tolist())
+        try:
+            for frame_index in range(int(requested.max()) + 1):
+                ok, frame = capture.read()
+                if not ok:
+                    raise IndexError(
+                        f"Could not decode frame {frame_index} from video {video_path}"
+                    )
+                if frame_index in wanted:
+                    frames_by_index[frame_index] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        finally:
+            capture.release()
+        return np.stack([frames_by_index[int(index)] for index in requested])
+
     decoder = _build_decoder(video_path, decoder_kwargs)
     return decoder.get_frames_at(indices=indices).data.numpy()
 

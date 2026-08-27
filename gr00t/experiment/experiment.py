@@ -25,7 +25,7 @@ from omegaconf import OmegaConf
 import torch
 import torch.distributed as dist
 from transformers import TrainingArguments, set_seed
-import wandb
+from transformers.utils import is_torch_tf32_available
 
 from gr00t.configs.base_config import Config
 from gr00t.configs.training.training_config import check_resume_compatibility
@@ -230,6 +230,7 @@ def run(config: Config):
 
     # wandb.init does network I/O; wrap so a rank-0 failure can't strand peers.
     if config.training.use_wandb:
+        import wandb
         with run_or_wait_on_rank0(label="wandb.init") as is_rank0:
             if is_rank0:
                 config_dict = {
@@ -267,6 +268,10 @@ def run(config: Config):
     else:
         per_device_train_batch_size = config.training.per_gpu_batch_size
 
+    tf32 = config.training.tf32 and is_torch_tf32_available()
+    if config.training.tf32 and not tf32:
+        logging.info("TF32 requested but unsupported by this device; disabling TF32")
+
     # Create training arguments
     training_args = TrainingArguments(
         output_dir=str(output_dir),
@@ -286,7 +291,7 @@ def run(config: Config):
         save_only_model=config.training.save_only_model,
         fp16=config.training.fp16,
         bf16=config.training.bf16,
-        tf32=config.training.tf32,
+        tf32=tf32,
         gradient_checkpointing=config.training.gradient_checkpointing,
         optim=config.training.optim,
         dataloader_num_workers=config.training.dataloader_num_workers,
