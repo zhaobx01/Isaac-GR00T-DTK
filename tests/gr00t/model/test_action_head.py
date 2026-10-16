@@ -24,9 +24,27 @@ import math
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
+from gr00t.model.modules import dit
 import pytest
 import torch
 from transformers.feature_extraction_utils import BatchFeature
+
+
+@pytest.mark.parametrize("hip,override,spark,expected", [
+    ("6.3", None, False, True),
+    ("6.3", "default", False, False),
+    (None, "math", False, True),
+    (None, None, False, False),
+    (None, None, True, True),
+    (None, "default", True, False),
+])
+def test_sdpa_backend_selection_without_accelerator(monkeypatch, hip, override, spark, expected):
+    monkeypatch.setattr(torch.version, "hip", hip)
+    monkeypatch.setattr(dit, "_is_spark_sm121", lambda: spark)
+    monkeypatch.delenv("GR00T_DIT_SDPA_MODE", raising=False)
+    if override is not None:
+        monkeypatch.setenv("GR00T_DIT_SDPA_MODE", override)
+    assert dit._should_force_math_sdpa() is expected
 
 
 def _small_config(**overrides) -> Gr00tN1d7Config:
@@ -122,6 +140,24 @@ class TestActionHeadForward:
         head.train()
         out = head.forward(_make_backbone_output(config), _make_action_input(config))
         assert torch.isfinite(out["loss"])
+
+    @pytest.mark.parametrize("sdpa_mode", ["default", "math"])
+    def test_multiple_updates_remain_finite(self, monkeypatch, sdpa_mode):
+        monkeypatch.setenv("GR00T_DIT_SDPA_MODE", sdpa_mode)
+        torch.manual_seed(17)
+        head = Gr00tN1d7ActionHead(_small_config())
+        head.train()
+        optimizer = torch.optim.AdamW(head.parameters(), lr=1e-4)
+        before = head.action_decoder.layer2.W.detach().clone()
+        for _ in range(3):
+            optimizer.zero_grad()
+            output = head(_make_backbone_output(head.config), _make_action_input(head.config))
+            assert torch.isfinite(output["loss"])
+            output["loss"].backward()
+            assert all(torch.isfinite(p.grad).all() for p in head.parameters() if p.grad is not None)
+            optimizer.step()
+            assert all(torch.isfinite(p).all() for p in head.parameters())
+        assert not torch.equal(before, head.action_decoder.layer2.W)
 
 
 class TestActionHeadGetAction:

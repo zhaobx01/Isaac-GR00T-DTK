@@ -61,16 +61,19 @@ class TrainingConfig:
     tf32: bool = True
     fp16: bool = False
     bf16: bool = True
+    check_numerics: bool = False
     eval_bf16: bool = True
 
     # Logging and saving
     logging_steps: int = 10
     save_steps: int = 1000
+    save_strategy: str = "steps"  # no, steps, epoch; independent of final model saving
     save_total_limit: int = 5
 
     # Model saving
     save_vl_model: bool = False  # Control whether to save VL model and processor in callbacks
     save_only_model: bool = False  # Skip optimizer/scheduler/RNG states — cannot resume training
+    save_final_model: bool = True
 
     # Default False so a rerun against an existing output_dir starts fresh.
     resume_from_checkpoint: bool = False

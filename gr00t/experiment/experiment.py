@@ -196,6 +196,9 @@ def save_initial_actions_artifact(train_dataset, save_cfg_dir: Path):
 
 def run(config: Config):
     """Main training function."""
+    if (config.training.check_numerics and config.training.num_gpus > 1 and
+            not config.training.use_ddp and config.training.deepspeed_stage != 2):
+        raise ValueError("Numerical diagnostics currently support DeepSpeed ZeRO-2 only")
     warn_configs(config)
     check_resume_compatibility(config.training)
 
@@ -254,6 +257,12 @@ def run(config: Config):
     pipeline = MODEL_REGISTRY.get(type(config.model))(config, save_cfg_dir)
     pipeline.setup()
     model = pipeline.return_model()
+    numerics_monitor = None
+    if config.training.check_numerics:
+        from gr00t.experiment.numerics import NumericalMonitor
+
+        numerics_monitor = NumericalMonitor(output_dir)
+        numerics_monitor.attach(model)
     train_dataset, eval_dataset = pipeline.return_dataset()
     data_collator = pipeline.return_collator()
     processor = pipeline.return_processor()
@@ -291,7 +300,9 @@ def run(config: Config):
         warmup_steps=config.training.warmup_steps,
         max_grad_norm=config.training.max_grad_norm,
         logging_steps=config.training.logging_steps,
+        logging_nan_inf_filter=not config.training.check_numerics,
         save_steps=config.training.save_steps,
+        save_strategy=config.training.save_strategy,
         save_total_limit=config.training.save_total_limit,
         save_only_model=config.training.save_only_model,
         fp16=config.training.fp16,
@@ -320,6 +331,7 @@ def run(config: Config):
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         multiprocessing_context=config.data.multiprocessing_context,
+        numerics_monitor=numerics_monitor,
     )
     trainer.remove_callback(ProgressCallback)
     trainer.add_callback(SamplesPerSecondProgressCallback())
@@ -367,7 +379,7 @@ def run(config: Config):
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            schedule=torch.profiler.schedule(skip_first=1, wait=1, warmup=5, active=1, repeat=1),
+            schedule=torch.profiler.schedule(skip_first=1, wait=1, warmup=20, active=1, repeat=1),
             # profile_memory=True,
             with_stack=True,
             # record_shapes=True,
@@ -379,8 +391,9 @@ def run(config: Config):
         trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
 
     # Save final model
-    trainer.save_model()
-    logging.info(f"Model saved to {output_dir}")
+    if config.training.save_final_model:
+        trainer.save_model()
+        logging.info(f"Model saved to {output_dir}")
 
     if config.training.assert_loss_less_than is not None:
         final_loss = trainer.loss

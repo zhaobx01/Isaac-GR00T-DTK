@@ -15,6 +15,7 @@
 
 # Finetune config used for single node post-training.
 from dataclasses import dataclass
+from typing import Literal
 import warnings
 
 
@@ -135,6 +136,12 @@ class FinetuneConfig:
     """Forward passes per optimizer step. Multiplies ``global_batch_size`` to
     produce the post-accumulation per-optimizer-step batch."""
 
+    check_numerics: bool = False
+    """Fail on non-finite inputs, activations, gradients, optimizer states or parameters."""
+
+    save_final_model: bool = True
+    """Disable for diagnostic runs that must not save model weights."""
+
     output_dir: str = "./outputs"
     """Directory where model checkpoints, logs, and outputs are saved."""
 
@@ -146,6 +153,9 @@ class FinetuneConfig:
 
     save_steps: int = 1000
     """Frequency (in training steps) at which to save checkpoints."""
+
+    save_strategy: Literal["no", "steps", "epoch"] = "steps"
+    """Checkpoint schedule; 'no' disables checkpoints, independently of the final model save."""
 
     save_total_limit: int = 5
     """Maximum number of checkpoints to keep before older ones are deleted."""

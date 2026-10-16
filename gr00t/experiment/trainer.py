@@ -188,7 +188,11 @@ class Gr00tTrainer(Trainer):
         """
         self.action_offset = kwargs.pop("action_offset", None)
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
+        self.numerics_monitor = kwargs.pop("numerics_monitor", None)
         super().__init__(*args, **kwargs)
+        if self.numerics_monitor is not None:
+            self.numerics_monitor.trainer = self
+            self.add_callback(self.numerics_monitor)
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
@@ -269,7 +273,11 @@ class Gr00tTrainer(Trainer):
                 os.path.join(latest_checkpoint, TRAINER_STATE_NAME)
             )
 
-        return super().train(resume_from_checkpoint=latest_checkpoint, **kwargs)
+        try:
+            return super().train(resume_from_checkpoint=latest_checkpoint, **kwargs)
+        finally:
+            if getattr(self, "numerics_monitor", None) is not None:
+                self.numerics_monitor.close()
 
     # ------------------------------------------------------------------
     # Loss / accuracy computation override
@@ -290,6 +298,8 @@ class Gr00tTrainer(Trainer):
         *and* model outputs, we calculate accuracy and push it to the logger.
         """
 
+        if self.numerics_monitor is not None:
+            inputs = self.numerics_monitor.prepare_batch(inputs)
         # Use parent implementation to preserve built-in functionality.
         loss, outputs = super().compute_loss(
             model,
@@ -297,6 +307,10 @@ class Gr00tTrainer(Trainer):
             return_outputs=True,
             num_items_in_batch=num_items_in_batch,
         )
+        if self.numerics_monitor is not None:
+            self.numerics_monitor.observe("raw_loss", loss)
+            self.numerics_monitor.boundary("forward")
+            self.numerics_monitor.event(stage="raw_loss", loss=float(loss.detach().cpu()))
         # import ipdb; ipdb.set_trace()
         # # save the model's embedding for the first step
         # input_embeddings = model.get_input_embeddings().weight.data.cpu()

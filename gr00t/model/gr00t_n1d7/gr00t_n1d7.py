@@ -594,8 +594,12 @@ class Gr00tN1d7(PreTrainedModel):
             BatchFeature containing loss and other outputs
         """
         # Prepare inputs for backbone and action head
+        # backbone_inputs：给 Cosmos 的图像和语言输入，例如pixel_values、input_ids、attention_mask
+        # action_inputs：给 DiT 的动作输入，例如state、action、embodiment_id等
         backbone_inputs, action_inputs = self.prepare_input(inputs)
+        # Cosmos 提取视觉语言特征
         backbone_outputs = self.backbone(backbone_inputs)
+        # DiT 动作头预测速度场并计算 loss
         action_outputs = self.action_head(backbone_outputs, action_inputs)
 
         return action_outputs

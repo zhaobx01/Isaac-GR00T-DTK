@@ -24,6 +24,7 @@ from diffusers.models.embeddings import SinusoidalPositionalEmbedding, TimestepE
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 def _is_spark_sm121() -> bool:
@@ -41,21 +42,19 @@ def _should_force_math_sdpa() -> bool:
     if override == "default":
         return False
 
+    # DTK/HIP default SDPA backends produce NaN gradients in DiT backward (bf16).
+    if torch.version.hip is not None:
+        return True
+
     return _is_spark_sm121()
 
 
 def _sdpa_context():
-    # Spark (sm121) currently hits noisy/broken PyTorch mem-efficient SDPA kernel dispatch.
-    # Force the safe math backend there; on every other platform this returns a no-op context.
+    # Use math on HIP and Spark unless explicitly overridden; retain other platform defaults.
     if not _should_force_math_sdpa():
         return nullcontext()
 
-    return torch.backends.cuda.sdp_kernel(
-        enable_flash=False,
-        enable_math=True,
-        enable_mem_efficient=False,
-        enable_cudnn=False,
-    )
+    return sdpa_kernel(SDPBackend.MATH)
 
 
 class TimestepEncoder(nn.Module):

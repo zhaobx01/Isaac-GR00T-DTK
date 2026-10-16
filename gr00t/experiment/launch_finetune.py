@@ -97,19 +97,25 @@ if __name__ == "__main__":
 
     config.model.load_bf16 = False
     config.model.reproject_vision = False
-    config.model.model_name = os.environ.get("VLM_MODEL_PATH", "nvidia/Cosmos-Reason2-2B")
+    config.model.model_name = os.environ.get(
+        "VLM_MODEL_PATH", "/workspace/data/checkpoints/nvidia/Cosmos-Reason2-2B"
+    )
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
     config.training.enable_profiling = ft_config.enable_profiling
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path
+    config.training.transformers_local_files_only = True
     config.training.optim = "adamw_torch"
     config.training.global_batch_size = ft_config.global_batch_size
     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
     config.training.learning_rate = ft_config.learning_rate
     config.training.gradient_accumulation_steps = ft_config.gradient_accumulation_steps
+    config.training.check_numerics = ft_config.check_numerics
+    config.training.save_final_model = ft_config.save_final_model
     config.training.output_dir = ft_config.output_dir
     config.training.save_steps = ft_config.save_steps
+    config.training.save_strategy = ft_config.save_strategy
     config.training.save_total_limit = ft_config.save_total_limit
     config.training.num_gpus = ft_config.num_gpus
     config.training.use_wandb = ft_config.use_wandb

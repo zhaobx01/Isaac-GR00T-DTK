@@ -1,0 +1,30 @@
+diff --git a/src/torchcodec/_core/SingleStreamDecoder.cpp b/src/torchcodec/_core/SingleStreamDecoder.cpp
+--- a/src/torchcodec/_core/SingleStreamDecoder.cpp
++++ b/src/torchcodec/_core/SingleStreamDecoder.cpp
+@@ -5,6 +5,7 @@
+ // LICENSE file in the root directory of this source tree.
+ 
+ #include "SingleStreamDecoder.h"
++#include <hip/hip_runtime.h>
+ #include <cstdint>
+ #include <cstdio>
+ #include <iostream>
+@@ -1223,11 +1223,13 @@
+     }
+ 
+     decodeStats_.numFramesReceivedByDecoder++;
+-    auto hipStatus = hipStreamSynchronize(0);
+-    TORCH_CHECK(
+-        hipStatus == hipSuccess,
+-        "hipStreamSynchronize failed in decodeAVFrame: ",
+-        hipGetErrorString(hipStatus));
++    if (deviceInterface_->device().is_cuda()) {
++      auto hipStatus = hipStreamSynchronize(0);
++      TORCH_CHECK(
++          hipStatus == hipSuccess,
++          "hipStreamSynchronize failed in decodeAVFrame: ",
++          hipGetErrorString(hipStatus));
++    }
+ 
+     // Is this the kind of frame we're looking for?
+     if (status == AVSUCCESS && filterFunction(avFrame)) {
