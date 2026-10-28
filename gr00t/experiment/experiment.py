@@ -196,6 +196,27 @@ def save_initial_actions_artifact(train_dataset, save_cfg_dir: Path):
 
 def run(config: Config):
     """Main training function."""
+    from gr00t.experiment.training_runtime import (
+        resolve_trainer_class,
+        resolve_compile_variant,
+        resolve_legacy_compile_request,
+        resolve_zero2_comm_switches,
+        resolve_zero2_pack_timing,
+    )
+
+    trainer_class = resolve_trainer_class(config)
+    compile_variant = resolve_compile_variant()
+    legacy_compile_request = resolve_legacy_compile_request(config.training, compile_variant)
+    from gr00t.Replacement.sequence_buckets import load_buckets, resolve_policy, validate_activation
+
+    sequence_policy, sequence_bucket_path, sequence_diagnostics = resolve_policy()
+    validate_activation(sequence_policy, sequence_diagnostics, compile_variant, legacy_compile_request)
+    sequence_buckets = load_buckets(sequence_bucket_path) if sequence_policy == "dynamic-buckets" else None
+    zero2_overlap, zero2_reduce_scatter = resolve_zero2_comm_switches()
+    if zero2_overlap or zero2_reduce_scatter:
+        from gr00t.Replacement.zero2_comm import validate_training_config as validate_zero2_comm_config
+
+        validate_zero2_comm_config(config, zero2_overlap, zero2_reduce_scatter)
     if (config.training.check_numerics and config.training.num_gpus > 1 and
             not config.training.use_ddp and config.training.deepspeed_stage != 2):
         raise ValueError("Numerical diagnostics currently support DeepSpeed ZeRO-2 only")
@@ -257,6 +278,19 @@ def run(config: Config):
     pipeline = MODEL_REGISTRY.get(type(config.model))(config, save_cfg_dir)
     pipeline.setup()
     model = pipeline.return_model()
+    compile_info = {"variant": compile_variant, "paths": []}
+    if legacy_compile_request is not None:
+        from gr00t.experiment.compilation import install_model_compile
+
+        compiled_paths = install_model_compile(model, **legacy_compile_request)
+        compile_info = {
+            "variant": "legacy-cli", "paths": compiled_paths, "request": legacy_compile_request
+        }
+    elif compile_variant != "off":
+        from gr00t.Replacement.model_compile import install, write_manifest
+
+        compile_info = install(model, compile_variant)
+        write_manifest(output_dir, compile_info)
     numerics_monitor = None
     if config.training.check_numerics:
         from gr00t.experiment.numerics import NumericalMonitor
@@ -272,7 +306,9 @@ def run(config: Config):
 
     # deepspeed config
     if config.training.num_gpus > 1 and not config.training.use_ddp:
-        deepspeed_config = config.get_deepspeed_config()
+        from gr00t.experiment.training_runtime import load_experiment_deepspeed
+
+        deepspeed_config = load_experiment_deepspeed(config.get_deepspeed_config())
     else:
         deepspeed_config = None
 
@@ -324,7 +360,7 @@ def run(config: Config):
     )
 
     # Create trainer
-    trainer = Gr00tTrainer(
+    trainer = trainer_class(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -333,8 +369,46 @@ def run(config: Config):
         multiprocessing_context=config.data.multiprocessing_context,
         numerics_monitor=numerics_monitor,
     )
+    if compile_variant != "off":
+        from gr00t.Replacement.model_compile import evidence_callback
+
+        trainer.add_callback(evidence_callback(model, compile_info))
+    if os.environ.get("GR00T_EXPERIMENT_CASE"):
+        from gr00t.Replacement.experiment_manifest import ExperimentManifestCallback
+
+        trainer.add_callback(ExperimentManifestCallback(trainer))
     trainer.remove_callback(ProgressCallback)
     trainer.add_callback(SamplesPerSecondProgressCallback())
+    from gr00t.Replacement.zero2_comm import verify_switch_consistency
+
+    verify_switch_consistency(zero2_overlap, zero2_reduce_scatter)
+    zero2_callback = None
+    if zero2_overlap or zero2_reduce_scatter:
+        from gr00t.Replacement.zero2_comm import Zero2CommCallback
+
+        zero2_callback = Zero2CommCallback(
+            trainer, zero2_overlap, zero2_reduce_scatter, output_dir=output_dir,
+            pack_timing=resolve_zero2_pack_timing(),
+        )
+        trainer.add_callback(zero2_callback)
+    if config.training.log_step_metrics:
+        from gr00t.experiment.trainer import StepMetricsCallback
+
+        trainer.add_callback(
+            StepMetricsCallback(
+                Path(output_dir) / "step_metrics",
+                run_info={
+                    "zero2_allgather_pipeline": os.environ.get("GR00T_ZERO2_ALLGATHER_PIPELINE", "0") == "1",
+                    "zero2_overlap": zero2_overlap,
+                    "zero2_reduce_scatter": zero2_reduce_scatter,
+                    "compile_variant": compile_info["variant"],
+                    "compiled_paths": compile_info["paths"],
+                    "legacy_compile_request": legacy_compile_request,
+                    "global_batch_size": config.training.global_batch_size,
+                    "num_gpus": config.training.num_gpus,
+                },
+            )
+        )
 
     trainer.add_callback(
         CheckpointFormatCallback(
@@ -358,37 +432,81 @@ def run(config: Config):
         run_on_rank0(save_initial_actions_artifact, train_dataset, save_cfg_dir)
 
     # Train
+    sequence_adapter = None
+    sequence_trainer_diagnostics = None
+    fixed_padding = None
     logging.info("🚀 Starting training...")
-    if config.training.enable_profiling:
-        from functools import partial
-
-        logging.info(f"{global_rank} Starting training with profiling...")
-
-        def on_trace_ready_handler(trainer, profile_dir, prof):
-            output_path = (
-                profile_dir / f"trace_rank_{global_rank}_iter_{trainer.state.global_step}.json"
+    try:
+        if sequence_policy == "dynamic-buckets" or sequence_diagnostics:
+            from gr00t.Replacement.sequence_buckets import (
+                DiagnosticRecorder, SequenceAdapter, TrainerDiagnostics,
             )
-            prof.export_chrome_trace(str(output_path))
-            logging.info(f"Trace saved to {output_path}")
 
-        profile_dir = output_dir / "profiling"
-        run_on_rank0(profile_dir.mkdir, parents=True, exist_ok=True, label="profile_dir.mkdir")
+            recorder = None
+            if sequence_diagnostics:
+                local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+                visible = os.environ.get("HIP_VISIBLE_DEVICES", "").split(",")
+                physical = visible[local_rank] if len(visible) > local_rank and visible[local_rank] else "unknown"
+                recorder = DiagnosticRecorder(output_dir / "sequence-diagnostics", rank=global_rank,
+                                              physical_device=physical)
+                sequence_trainer_diagnostics = TrainerDiagnostics(trainer, recorder)
+                sequence_trainer_diagnostics.install()
+            targets = [("dit" if path == "action_head.model" else "vl", model.get_submodule(path), path)
+                       for path in compile_info["paths"]]
+            sequence_adapter = SequenceAdapter(targets, sequence_buckets, recorder=recorder)
+            sequence_adapter.__enter__()
+        if sequence_policy in ("pad-152-156", "pad-156"):
+            from gr00t.Replacement.fixed_sequence_padding import FixedSequencePadding
 
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            schedule=torch.profiler.schedule(skip_first=1, wait=1, warmup=20, active=1, repeat=1),
-            # profile_memory=True,
-            with_stack=True,
-            # record_shapes=True,
-            on_trace_ready=partial(on_trace_ready_handler, trainer, profile_dir),
-        ) as prof:
-            trainer.add_callback(ProfCallback(prof=prof))
+            fixed_padding = FixedSequencePadding(
+                trainer, sequence_policy, data_collator.processor.tokenizer.pad_token_id,
+                output_dir, global_rank,
+            ).install()
+        if config.training.enable_profiling:
+            from functools import partial
+
+            from gr00t.experiment.profiling import make_profiler_schedule
+
+            logging.info(f"{global_rank} Starting training with profiling...")
+
+            def on_trace_ready_handler(trainer, profile_dir, prof):
+                if global_rank == 0:
+                    table = prof.key_averages().table(sort_by="self_cuda_time_total")
+                    print(table)
+                    (profile_dir / "rank0-key-averages.txt").write_text(table + "\n")
+                output_path = (
+                    profile_dir / f"trace_rank_{global_rank}_iter_{trainer.state.global_step}.json"
+                )
+                prof.export_chrome_trace(str(output_path))
+                logging.info(f"Trace saved to {output_path}")
+
+            profile_dir = output_dir / "profiling"
+            run_on_rank0(profile_dir.mkdir, parents=True, exist_ok=True, label="profile_dir.mkdir")
+
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=make_profiler_schedule(config.training),
+                # profile_memory=True,
+                with_stack=config.training.profiler_with_stack,
+                # record_shapes=True,
+                on_trace_ready=partial(on_trace_ready_handler, trainer, profile_dir),
+            ) as prof:
+                trainer.add_callback(ProfCallback(prof=prof))
+                trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
+        else:
             trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
-    else:
-        trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
+    finally:
+        if fixed_padding is not None:
+            fixed_padding.close()
+        if sequence_adapter is not None:
+            sequence_adapter.close()
+        if sequence_trainer_diagnostics is not None:
+            sequence_trainer_diagnostics.close()
+        if zero2_callback is not None:
+            zero2_callback.close()
 
     # Save final model
     if config.training.save_final_model:

@@ -103,6 +103,12 @@ if __name__ == "__main__":
     config.model.backbone_trainable_params_fp32 = True
     config.model.use_relative_action = True
     config.training.enable_profiling = ft_config.enable_profiling
+    config.training.profiler_skip_first = ft_config.profiler_skip_first
+    config.training.profiler_wait = ft_config.profiler_wait
+    config.training.profiler_warmup = ft_config.profiler_warmup
+    config.training.profiler_active = ft_config.profiler_active
+    config.training.profiler_repeat = ft_config.profiler_repeat
+    config.training.profiler_with_stack = ft_config.profiler_with_stack
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path
     config.training.transformers_local_files_only = True
@@ -112,6 +118,13 @@ if __name__ == "__main__":
     config.training.learning_rate = ft_config.learning_rate
     config.training.gradient_accumulation_steps = ft_config.gradient_accumulation_steps
     config.training.check_numerics = ft_config.check_numerics
+    config.training.log_step_metrics = ft_config.log_step_metrics
+    config.training.compile_dit_blocks = ft_config.compile_dit_blocks
+    config.training.compile_dit_model = ft_config.compile_dit_model
+    config.training.compile_text_layers = ft_config.compile_text_layers
+    config.training.compile_text_layer_forwards = ft_config.compile_text_layer_forwards
+    config.training.compile_vl_self_attention_blocks = ft_config.compile_vl_self_attention_blocks
+    config.training.compile_mode = ft_config.compile_mode
     config.training.save_final_model = ft_config.save_final_model
     config.training.output_dir = ft_config.output_dir
     config.training.save_steps = ft_config.save_steps

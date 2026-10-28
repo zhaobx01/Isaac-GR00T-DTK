@@ -62,6 +62,13 @@ class TrainingConfig:
     fp16: bool = False
     bf16: bool = True
     check_numerics: bool = False
+    log_step_metrics: bool = False
+    compile_dit_blocks: bool = False
+    compile_dit_model: bool = False
+    compile_text_layers: bool = False
+    compile_text_layer_forwards: bool = False
+    compile_vl_self_attention_blocks: bool = False
+    compile_mode: str = "default"
     eval_bf16: bool = True
 
     # Logging and saving
@@ -119,6 +126,12 @@ class TrainingConfig:
 
     # Profiling
     enable_profiling: bool = False
+    profiler_skip_first: int = 1
+    profiler_wait: int = 1
+    profiler_warmup: int = 20
+    profiler_active: int = 1
+    profiler_repeat: int = 1
+    profiler_with_stack: bool = True
 
     # Max number of retries in training for fault tolerance
     max_retries: int = 3

@@ -139,6 +139,27 @@ class FinetuneConfig:
     check_numerics: bool = False
     """Fail on non-finite inputs, activations, gradients, optimizer states or parameters."""
 
+    compile_dit_blocks: bool = False
+    """Compile the 32 action DiT blocks; mutually exclusive with compile_dit_model."""
+
+    compile_dit_model: bool = False
+    """Compile the whole action DiT instance."""
+
+    compile_text_layers: bool = False
+    """Compile the 16 retained text decoder layer modules."""
+
+    compile_text_layer_forwards: bool = False
+    """Compile text layer forwards; mutually exclusive with compile_text_layers."""
+
+    compile_vl_self_attention_blocks: bool = False
+    """Compile the four visual-language self-attention blocks."""
+
+    compile_mode: str = "default"
+    """torch.compile mode for legacy CLI scopes; do not combine with the env selector."""
+
+    log_step_metrics: bool = False
+    """Write per-rank step wall times and peak device memory to output_dir/step_metrics."""
+
     save_final_model: bool = True
     """Disable for diagnostic runs that must not save model weights."""
 
@@ -181,6 +202,13 @@ class FinetuneConfig:
 
     enable_profiling: bool = False
     """Capture a PyTorch profiler trace during training."""
+
+    profiler_skip_first: int = 1
+    profiler_wait: int = 1
+    profiler_warmup: int = 20
+    profiler_active: int = 1
+    profiler_repeat: int = 1
+    profiler_with_stack: bool = True
 
     ds_weights_alpha: float | None = None
     """Power-law exponent for dataset soup weighting. When set, each dataset's

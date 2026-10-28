@@ -1,8 +1,11 @@
 # GR00T DTK 优化与适配记录
 
+> 当前工作区说明：本文件保留历史实验与命令。DiT/Text/VL 编译开关已恢复；regroup-serial、外部 DeepSpeed 配置探测与通信诊断入口已移除。可选流水现通过 `GR00T_ZERO2_ALLGATHER_PIPELINE=1` 启用，默认关闭。当前用法及 ZeRO-2 通信优化汇总见 [运行手册第七节](../dtk_libero_runbook.md#七zero-2-通信优化)。
+
+
 > 归档说明：本副本随代码保存，原始记录保留在 `/workspace/scripts/Optimization/`。提交状态和实验结论描述记录时的状态；模型、数据、训练输出及 DTK 运行环境需单独准备。
 
-记录日期：2026-10-14。对象：`/workspace/Isaac-GR00T`，GR00T N1.7、Cosmos Reason2、DTK/HIP 环境。
+记录日期：2026-10-19。对象：`/workspace/Isaac-GR00T`，GR00T N1.7、Cosmos Reason2、DTK/HIP 环境。
 本记录基于本地 Git 历史、当前差异和已有实验记录；不修改模型结构、权重或运行环境。
 
 | 分类 | 主要内容 | 应如何理解 |
@@ -11,6 +14,7 @@
 | 兼容修复 | TF32 能力判断、FlashAttention 编译边界、DiT math SDPA | 优先保证可运行和数值稳定，可能增加开销 |
 | 运行适配 | 本地模型、视频读取、启动路径、容器与依赖 | 解决环境和数据链路问题，不等于模型计算提速 |
 | 可观察性与控制 | 吞吐显示、profiler、数值检查、保存策略 | 提供分析或保护能力；测量本身可能影响速度 |
+| 可选编译（默认关闭） | DiT 逐块/整体、文本层 text_v2、VL 自注意力 | 有短程测速结果，未通过正确性与启用验收 |
 
 ## 1. 官方来源与适配时间线
 
@@ -18,11 +22,12 @@
 | --- | --- | --- |
 | 官方基线 | `51d4c89f72fda44cbf77285c6a8114b52676b8a1` | GR00T N1.7；提交说明为 Add support for Jetpack 7.2 on Orin and Thor |
 | 第一轮 | `d9bdcf9686649761440496445dd60c1bbb225ea1` | HCU 基础适配，4 个文件，+61/-3 |
-| 第二轮、当前 HEAD | `2838dd8f9319ac4cae0b36de413d25783456bfa7` | 位置计算、局部编译与训练观测，6 个文件，+269/-4 |
-| 当前工作区 | 尚未提交 | HIP math、离线加载、启动与保存控制、数值检查和文档 |
+| 第二轮 | `2838dd8f9319ac4cae0b36de413d25783456bfa7` | 位置计算、局部编译与训练观测，6 个文件，+269/-4 |
+| 适配代码归档、当前 HEAD | `f85c755ebf0be225e26f2b75cbac618868fde6f3` | 归档 HIP math、离线加载、启动与保存控制、数值检查和文档 |
+| 当前工作区 | 尚未提交 | 可选模型编译（DiT/文本/VL）、骨干 `use_cache=False`、Profiler 采样配置、逐步指标及相关测试与文档 |
 
 [官方基线提交](https://github.com/NVIDIA/Isaac-GR00T/commit/51d4c89f72fda44cbf77285c6a8114b52676b8a1)。
-演进关系为 `51d4c89 → d9bdcf9 → 2838dd8 → 未提交修改`。
+演进关系为 `51d4c89 → d9bdcf9 → 2838dd8 → f85c755 → 当前工作区修改`。
 可确认的是提交来源；当前检出状态不能证明最初下载自官方哪个分支，也不表示已同步官方后续更新。
 
 ### 1.1 不应计入本地新增优化的上游实现
@@ -44,7 +49,7 @@
 | --- | --- | --- |
 | TF32 能力判断 | NVIDIA 配置不能直接假定 HCU 支持 TF32 | 用 `is_torch_tf32_available()` 与配置共同决定开关；不支持时关闭，不会自动把所有计算改成 FP32 |
 | W&B 延迟导入 | 未使用跟踪也可能被其依赖阻断 | 仅在 `use_wandb` 为真时导入；是依赖解耦，不是算子加速 |
-| 本地 Cosmos 路径 | 固定远端 ID 不适合离线容器 | 新增 `VLM_MODEL_PATH` 覆盖；当时仍以远端 ID 为默认值，当前未提交修复才将默认值改为本地路径并限制本地加载 |
+| 本地 Cosmos 路径 | 固定远端 ID 不适合离线容器 | 新增 `VLM_MODEL_PATH` 覆盖；当时仍以远端 ID 为默认值，后续纳入 `f85c755` 的修复将默认值改为本地路径并限制本地加载 |
 | OpenCV 读取备选 | 为视频读取提供可替代路径 | `VIDEO_DECODER_BACKEND=opencv` 时按索引读取、转 RGB、恢复请求顺序；可能增加解码成本，当前不强制启用 |
 | 启动脚本 | 集中配置模型、数据与多卡参数 | 新增 `start.sh`；路径与离线变量的后续修复属于当前工作区，不混记为第一轮实现 |
 
@@ -471,16 +476,30 @@ return not already_disabled
 unset GR00T_DIT_SDPA_MODE
 ```
 
-这是当前未提交的兼容修改，不属于 `2838dd8` 的位置计算或编译优化。
+这是已纳入 `f85c755` 的兼容修改，不属于 `2838dd8` 的位置计算或编译优化。
 
-### 4.2 辅助能力与运行修复
+### 4.2 骨干前向禁用 KV cache（`use_cache=False`）
 
-以下列出新增或增强的观测、数值保护、运行控制与环境适配能力，不改变模型架构或训练目标。
+- **动机**：训练只使用骨干的 hidden states，不做自回归解码。`config.use_cache=True` 时每次前向都会构建 `DynamicCache`，各文本层以自身 `layer_idx` 读写 cache，guard 逐层不同；编译文本层时 16 层各需一份图，超出重编译上限后部分路径回到 eager。
+- **修改机制**：在 [qwen3_backbone.py](../../gr00t/model/modules/qwen3_backbone.py#L595) 的 `Qwen3Backbone.forward` 中显式传入 `use_cache=False`。
+- **适用范围**：无条件生效，不受任何编译开关控制；baseline 与所有编译方案都在此行为下运行（见 6.2）。属于当前工作区改动。
+- **预期收益与代价**：去掉训练中不使用的 cache 构建，并为文本层编译消除逐层 cache guard；不改变注意力计算、精度或训练目标。
+- **证据/限制**：CPU 用例 `test_backbone_forward_disables_kv_cache` 确认调用参数；不宣称自回归生成或推理 cache 路径已验收。
+
+```diff
+-outputs = self.model(**vl_input, output_hidden_states=True)
++outputs = self.model(**vl_input, output_hidden_states=True, use_cache=False)
+```
+
+### 4.3 辅助能力与运行修复
+
+以下列出新增或增强的观测、数值保护、运行控制与环境适配能力，不改变模型架构或训练目标。可选模型编译开关见 6.1。
 
 | 新增或增强项 | 实现方式 | 作用与边界 |
 | --- | --- | --- |
 | 吞吐进度条 | `SamplesPerSecondProgressCallback` 按 rank0 主机时间窗口和全局 batch 估算 sample/s | 直观观察吞吐波动；不是严格稳态测速或相对基线的提速比 |
-| Profiler 微调入口与采样调整 | 为已有 profiler 增加 `FinetuneConfig.enable_profiling` 配置；当前窗口为 `skip_first=1, wait=1, warmup=20, active=1, repeat=1` | 延长预热后记录一个 step；采集可能扰动调度和耗时，基础 profiler 不是本地新增能力 |
+| Profiler 微调入口与采样调整 | 为已有 profiler 增加 `FinetuneConfig.enable_profiling` 配置；采样窗口由 `profiler_*` 字段配置，经 `profiling.make_profiler_schedule` 生成，默认 `skip_first=1, wait=1, warmup=20, active=1, repeat=1` | 延长预热后记录一个 step；采集可能扰动调度和耗时，基础 profiler 不是本地新增能力 |
+| 逐步指标 | `--log-step-metrics` 启用 `StepMetricsCallback`，按 rank 记录每步主机墙钟耗时与峰值 allocated/reserved 显存，训练结束写入 `step_metrics/rank-XX.json`，附带编译开关和 `compiled_paths` | 步耗时含取数据时间，不额外同步设备；用于第六章测速，不等同设备事件耗时 |
 | 可选数值安全检查 | `--check-numerics` 接入配置、训练入口、Trainer 和 `NumericalMonitor` | 默认关闭；检查参数、buffer、输入、动作掩码、主要模块输出、原始 loss、梯度、优化器状态及更新后参数，同时关闭 loss 日志 NaN/Inf 过滤 |
 | 异常退出与逐 rank 日志 | 更新前后 hook 记录本地结果，在一致阶段边界汇总异常；写入 `<output-dir>/numerics/rank-*.jsonl` | 检查负数分组梯度范数，异常时停止更新或阻止最终保存，退出时清理 hook；不删除此前已有 checkpoint |
 | 灵活保存控制 | 新增 `save_strategy`、`save_final_model`，分别控制中途 checkpoint 和最终保存 | 支持不保存、按策略保存或仅结束保存一次；与数值检查独立，沿用的 `save_only_model` 不是新增开关 |
@@ -492,49 +511,161 @@ unset GR00T_DIT_SDPA_MODE
 | LIBERO 数据准备与校验 | AV1 转 H.264，校验视频属性/帧数，更新编码元数据并补齐 `meta/modality.json`；验证 Parquet 读取 | 解决数据格式及解码链路问题，不改变状态、动作语义或训练目标 |
 | torchcodec CPU 解码修复 | `/workspace/scripts/torchcodec_cpu_hip_sync.patch` 将无条件 HIP 同步限制为 CUDA/HIP 设备，重新构建并替换三个扩展库 | CPU 解码不再触发无效设备同步；未替换厂商 PyTorch，换容器/重装后需重新应用并验证，H.264 硬件解码限制仍存在 |
 | HTA 离线分析 | 在 `/workspace/.venvs/hta` 安装 HTA 0.5.0，解析现有 8 rank trace，生成时间、kernel、idle 和通信重叠统计 | 与 DTK 主环境隔离；单 iteration、时间戳及后端兼容性限制仍需考虑，解析成功不代表归因全部成立 |
-| 回归测试补充 | `test_action_head.py`、`test_numerics.py` 覆盖后端选择、多次更新、异常拦截、更新前停止、负数范数、保存、索引扫描及双 rank 退出 | 为兼容与检查能力提供回归覆盖，具体结果和缺口见 5.2 |
+| 回归测试补充 | `test_action_head.py`、`test_numerics.py` 覆盖后端选择、多次更新、异常拦截、更新前停止、负数范数、保存、索引扫描及双 rank 退出 | 为兼容与检查能力提供回归覆盖，具体结果和缺口见 [runbook 测试记录](../dtk_libero_runbook.md#41-已完成的验收) |
 | 文档与代码说明 | 补充独立贡献指南、DTK LIBERO runbook、模型 forward 中文说明和 trace 分析报告 | 便于运行、验收和性能排查；说明性修改不改变模型计算 |
 
 数值检查支持普通 AdamW 单卡/DDP 与 DeepSpeed ZeRO-2；其他 ZeRO stage 在模型加载前拒绝。完整扫描、同步和日志可能明显降低吞吐，与 4.1 的 math 后端开销分开评估。非零梯度与参数更新是整轮累计证据，不保证每个参数每步都更新；仅保存模型而不保留优化器等状态时不能精确续训。
 
 使用方式见 [DTK LIBERO Runbook](../../getting_started/dtk_libero_runbook.md)，性能统计与编译候选见 [Trace 分析报告](groot_torch_compile_trace_analysis.md)。
 
-## 5. 验证证据、局限与后续工作
+## 5. Baseline 测试环境与结果
 
-### 5.1 已有实验记录
+### 5.1 环境与配置
 
-报告与输出均位于 `/workspace/data/`；下表不同运行不能混用结论。
+测试日期：2026-10-16。源码为 `f85c755` 加当时工作区修改，快照保存在实验目录的 `source/`。
+本节“原始基线”是当前 DTK 适配版本，不是官方未经适配的全 eager 模型。
 
-| 运行 | 已观察到的证据 | 尚不能证明 |
-| --- | --- | --- |
-| 历史失败 1,000 步，batch 64 | 运行结束且保存，但全量扫描发现 537 个张量含 NaN；输出 `outputs/libero-long-b64-s1000-20261014-104840` | 保存成功不等于有效训练 |
-| 显式 math，8 卡 batch 64，100 步 | 125.18 秒，平均 loss 1.184575；各 rank 数值检查通过；`outputs/numerics-math-b64-s100-20261014-143034/report.json` | 未保存，未做保存重载；不能衡量每个优化项收益 |
-| 自动 math，同配置 100 步 | 变量未设置；125.16 秒，平均 loss 1.184575；`outputs/numerics-auto-b64-s100-20261014-145906/report.json` | 证明当前自动选择短程有效，不代表长期验收 |
-| 用户新贴的 1,000 步日志 | 日志显示完成并保存至 `outputs/libero10-finetune-20261014-163503-1653289`；335.77 秒，平均 loss 0.387624，95.304 sample/s，片段中的 loss/grad_norm 有限 | 未核实该运行全部配置、检查开关和全部权重；缺保存权重全量扫描及离线动作预测证据 |
+| 项目 | 实际配置 |
+| --- | --- |
+| 加速卡与驱动 | BW1000 64G × 8；驱动 `6.4.2-V2.1.0` |
+| Python / PyTorch / HIP | 3.10.12 / 厂商 PyTorch 2.10.0 / 6.3.26113 |
+| 主要依赖 | Transformers 4.57.3、DeepSpeed 0.18.4、Triton 3.6.0、FlashAttention 2.8.4；完整构建号见 `manifest.json` |
+| GR00T 权重 | `/workspace/data/checkpoints/GR00T-N1.7-3B-local-cosmos` |
+| Cosmos 权重 | `/workspace/data/checkpoints/nvidia/Cosmos-Reason2-2B` |
+| LIBERO H.264 数据 | `/workspace/data/libero_10_no_noops_1.0.0_lerobot_h264` |
+| 训练精度与 batch | BF16、全局 batch 32、每卡 batch 4、梯度累积 1 |
+| 优化器与采样 | ZeRO-2、AdamW、学习率 1e-4、seed 42、每 rank 4 个数据 worker |
 
-新 1,000 步的可见末段 loss 约 0.14～0.17、梯度范数约 0.34～1.11，只能作为日志层面的正常迹象。
-它与早期失败运行不是同一输出；不能用有限日志代替全量参数、优化器状态和预测检查。
-100 步与新 1,000 步的 batch、worker、检查及热身条件并未建立可比性，不计算提速百分比。
-三轮匹配短对照未完整完成，历史记录在 `outputs/numerics-factorial-20261014-next/report.json`，不能写成三轮均通过。
+### 5.2 采集方法
 
-### 5.2 证据等级与测试缺口
+- 关闭新增 DiT 编译：`compile_dit_blocks=False`、`compile_dit_model=False`；保留既有视觉 Block 编译和 HIP 自动 math SDPA。
+- 三轮独立进程测速，每轮 80 步；第 1–20 步预热，第 21–80 步统计，共 1,920 个全局样本。
+- 各轮启动环境见原始归档；不清理系统页缓存或用户已有缓存。
+- 开启 `--log-step-metrics`；测速关闭 Profiler、数值检查和图断诊断日志。
+- `save_strategy=no`、`save_final_model=False`；四组任务均未保存模型。
 
-| 等级 | 可支持的结论 | 不可替代的验证 |
-| --- | --- | --- |
-| 理论动机 | 某种实现可能减少同步、构造或调度 | 不能证明实际瓶颈或收益 |
-| 代码实现 | 已存在 CPU 处理、缓存或编译调用 | 不能证明等价性、实际后端或提速 |
-| 实际验证 | 特定配置下测试或训练的明确结果 | 不能外推其他硬件、batch、输入或所有优化项 |
+吞吐公式：`32 × 60 / max_rank(sum(step_seconds[20:80]))`。
+逐步耗时先取该步 8 rank 的最大值，再统计中位数与 P90；吞吐不是中位步耗时的简单倒数。
+计时采用现有训练流程的主机墙钟间隔，不是 GPU 算子耗时；没有额外增加逐步设备同步。
 
-当前未找到直接覆盖三个 CPU 位置改写函数、缓存命中/失效及编译边界等价性的测试。
-`tests/gr00t/model/test_qwen3_rope.py` 主要覆盖上游 RoPE buffer 与解析公式，不是这些本地改写的等价性证据。
-`tests/gr00t/model/test_action_head.py` 覆盖 HIP/Spark/覆盖变量分派和 CPU 多次更新，不能代替真实 HIP BF16 或多卡测试。
-`tests/gr00t/experiment/test_numerics.py` 验证异常检测、更新拦截、保存及分布式一致退出，不验证位置算法性能。
-清理后的重点 CPU 回归曾为 45 项通过；项目 CPU 测试仍有缺少可选依赖和 LFS 示例的失败，不宣称全项目通过。
+### 5.3 测速结果
 
-### 5.3 后续建议（本次不执行）
+| 轮次 | 吞吐（samples/s） | 中位步耗时（ms） | P90（ms） | 首步最大耗时（s） |
+| --- | ---: | ---: | ---: | ---: |
+| speed-r1 | 106.071 | 299.248 | 304.885 | 81.343 |
+| speed-r2 | 104.896 | 304.767 | 310.458 | 79.165 |
+| speed-r3 | 106.508 | 298.857 | 305.542 | 79.596 |
 
-1. 逐项比较原始与改写位置函数的输出及梯度，覆盖动态网格、视频、mask、merge size、设备/dtype 和 tracing。
-2. 测试缓存命中、失效及权重更新后结果；对 eager/compiled 和注意力注册入口做隔离验证。
-3. 固定模型、数据、种子、batch、worker、检查和保存策略，一次只切换一个因素；分开记录冷启动、稳定吞吐、峰值显存和同步次数。
-4. 对新 1,000 步输出扫描全部权重，再离线重载执行动作预测，检查有限性；与历史失败输出分开管理。
-5. 完成更长训练和任务成功率评估，再讨论收敛、策略质量或部署结论；不得以日志低 loss 或完成保存代替这些验收。
+三轮吞吐中位数为 **106.071 samples/s**，跨轮变异系数为 **0.643%**。
+三轮各取所有 rank 的最大峰值，allocated 均为 **10.318 GiB**，reserved 均为 **12.924 GiB**。
+这是包含预热的整轮 PyTorch allocator 峰值，不是稳态窗口专属峰值，也不等同整卡显存。
+
+首步包含实际执行、已有视觉编译和 autotune，不能称为纯编译时间。
+三轮均取得 8 rank × 80 步记录；包含冷启动的训练器整体吞吐不用于上述稳态比较。
+
+### 5.4 Trace 与 HTA 摘要
+
+独立 Trace 任务同样运行 80 步，设置为 `skip_first=20, wait=1, warmup=5, active=3, repeat=1`，
+关闭调用栈，单独开启图断/重编译日志。8 rank 均采集到连续的 `ProfilerStep#26–28` 和设备 kernel。
+文件名 `trace_rank_<rank>_iter_29.json` 中的 29 是回调计数，不是 active step 数量。
+
+| 指标 | 本次结果与口径 |
+| --- | --- |
+| rank 0 三步窗口 | CPU 1,027.243 ms；GPU 主流 annotation 1,009.717 ms |
+| rank 0 设备活动 | 主流窗口内所有流的 kernel、memcpy、memset 并集 822.975 ms |
+| 原始事件空档 | rank 0 为 186.742 ms、18.494%；各 rank 为 14.703%–21.050% |
+| HTA temporal idle | rank 0 为 21.33%；各 rank 为 17.53%–23.86% |
+| HTA kernel 分类 | 跨 rank 累计活动时长：计算 58.5%、通信 37.8%、memory 3.7% |
+| 通信事件 | rank 0 三步 AllReduce 51 次、225.986 ms；AllGather 6 次、71.748 ms |
+| 通信计算重叠 | 本采样窗口 HTA 对 8 rank 均报告 0.0%，不外推到其他运行 |
+| 小 kernel 与已有编译 | rank 0 的 47.81% kernel 次数短于 10 μs；记录到 360 条 Torch-Compiled Region 事件 |
+
+原始事件空档按主流三个窗口计算；辅助流同名 annotation 不重复计作 step。
+HTA 0.5.0 在独立环境中识别全部 8 rank，保留最后一个完整 active step，四项分析均成功。
+HTA idle 与原始事件并集的窗口、过滤规则不同，不能互换；kernel 分类比例也不是训练墙钟占比。
+Compiled Region 事件数不是独立图数量，更不表示已开启 DiT 编译。
+Profiler 会扰动执行；上述三步采样耗时不用于吞吐结论。
+
+### 5.5 产物与短复测命令
+
+所有产物位于 `/workspace/data/outputs/compile-baseline-20261016-091642/`：
+
+| 产物 | 位置 |
+| --- | --- |
+| 完整报告与限制 | [baseline_report.md](/workspace/data/outputs/compile-baseline-20261016-091642/baseline_report.md) |
+| 环境与配置 | [manifest.json](/workspace/data/outputs/compile-baseline-20261016-091642/manifest.json)；各组 `command.json`、`experiment_cfg/config.yaml` |
+| 测速 CSV | [timing_summary.csv](/workspace/data/outputs/compile-baseline-20261016-091642/analysis/timing_summary.csv)；同目录 `per_rank_summary.csv`、`per_step_wall.csv` |
+| 原始 Trace 与汇总 | [trace/profiling/](/workspace/data/outputs/compile-baseline-20261016-091642/trace/profiling/)；[trace_summary.csv](/workspace/data/outputs/compile-baseline-20261016-091642/analysis/trace_summary.csv) |
+| HTA 汇总 | [analysis/hta/](/workspace/data/outputs/compile-baseline-20261016-091642/analysis/hta/) |
+| 启动脚本 | [run.sh](/workspace/data/outputs/compile-baseline-20261016-091642/run.sh)、[run_baseline.py](/workspace/data/outputs/compile-baseline-20261016-091642/run_baseline.py) |
+
+以下示例复用现有脚本，在新目录运行三轮测速、独立 Trace 及离线分析；本次文档更新不执行这些操作。
+脚本每组启动前检查显存 ≤15%、利用率 ≤5%，最多等待 30 秒；拒绝覆盖已有实验 manifest，
+累计设备任务预算 60 分钟，不停止其他任务或修复设备节点。
+
+```bash
+set -euo pipefail
+previous=/workspace/data/outputs/compile-baseline-20261016-091642
+next="/workspace/data/outputs/compile-baseline-$(date -u +%Y%m%d-%H%M%S)-$$"
+mkdir "$next"
+cp "$previous/run.sh" "$previous/run_baseline.py" \
+   "$previous/analyze_baseline.py" "$previous/analyze_hta.py" "$next/"
+bash "$next/run.sh" > "$next/orchestrator.log" 2>&1
+mkdir -p "$next/analysis"
+OMP_NUM_THREADS=1 python "$next/analyze_baseline.py" > "$next/analysis/profile-model.log" 2>&1
+OMP_NUM_THREADS=1 /workspace/.venvs/hta/bin/python "$next/analyze_hta.py" > "$next/analysis/hta.log" 2>&1
+```
+
+本轮仅建立性能基线，未执行完整数值检查或保存重载，不能据此认定训练数值、模型质量或部署通过。
+资源隔离记录及单窗口采样限制详见完整报告；外部实验文件不随本文自动归档。
+
+## 6. 可选模型编译（当前工作区，2026-10-19）
+
+### 6.1 实现与范围
+
+**共用机制**：`experiment.run` 在加载模型后、挂载数值检查之前调用 [`install_model_compile`](../../gr00t/experiment/compilation.py#L173)。各开关默认关闭；安装前统一预检全部目标的类型、数量、实例唯一性和已有包装，任一不通过则不包装任何目标。相同配置重复调用幂等；配置改变或安装失败要求新进程。新增范围均为实例级 `fullgraph=False`、dynamic 默认，`--compile-mode` 默认 `default`。这与 3.3.1 不同：视觉 Block 编译是类级 `max-autotune-no-cudagraphs`，始终启用，不受下列开关控制。
+
+| 开关 | 编译目标 | 边界与关系 | 动机与代价 |
+| --- | --- | --- | --- |
+| `--compile-dit-blocks` | `action_head.model.transformer_blocks.0–31`，逐块 `module.compile` | 与整体 DiT 互斥；可与文本、VL 组合 | 动作 DiT 是主要计算区；图小、编译成本较低，块间仍为 eager 调度 |
+| `--compile-dit-model` | `action_head.model`，1 个区域 | 与逐块互斥 | 更大范围融合与调度优化；首次编译和显存峰值更高（见 6.3） |
+| `--compile-text-layer-forwards`（text_v2） | `backbone.model.language_model.layers.0–15` 的 `forward` | 与旧 `--compile-text-layers` 互斥；旧方案仅作对照 | 编译骨干文本层；机制见下文 |
+| `--compile-vl-self-attention-blocks` | `action_head.vl_self_attention.transformer_blocks.0–3` | 可与 DiT、文本组合 | 范围小，预期收益有限 |
+
+关闭方式为新进程不传对应开关或传 `--no-...`；关闭后回到这些模块的原 eager 路径，3.3.1 的视觉编译与 4.1 的 math SDPA 保持不变。使用方式见 [runbook 6.1](../dtk_libero_runbook.md#61-编译范围与选择)。
+
+**text_v2 与旧文本方案**：`output_hidden_states=True` 时，Transformers 在每次调用中把各 Decoder 层实例的 `forward` 替换为收集闭包，闭包内的已收集输出数量逐层不同。旧方案编译整个层模块，guard 包含这一差异，16 层各需一份图；真实训练 text-r1 命中 `recompile_limit`。text_v2 只把类方法 `forward` 编译一次，再按实例绑定，编译点位于收集闭包之内，闭包本身保持 eager：
+
+```python
+if cls not in shared_forwards:
+    shared_forwards[cls] = torch.compile(cls.forward, mode=mode, fullgraph=False)
+module.forward = types.MethodType(shared_forwards[cls], module)
+```
+
+该机制依赖 Transformers 调用时读取实例 `forward`、正常返回后恢复；异常退出后闭包可能残留，模型不得复用。按实例绑定保证 `deepcopy` 独立，但整体模型不可 pickle，保存使用 `state_dict` 并在新实例上重新安装。还需配合 4.2 的 `use_cache=False`。CPU 上经 `Qwen3VLForConditionalGeneration` 调用只生成 1 份图，hidden states 与 eager 完全相等；这只是 CPU 接入证据，不代表 DTK Inductor 正确性。
+
+### 6.2 配置与结果边界
+
+本节使用当前已跑通的 DTK 容器，未切换 Harbor 新基础镜像。各组使用原始 GR00T checkpoint、LIBERO H.264 数据、8 卡、全局 batch 32、BF16、梯度累积 1、ZeRO-2、AdamW、学习率 `1e-4`、seed 42，每 rank 4 个数据 worker。保留已有视觉编译、HIP math SDPA 和 `use_cache=False`（见 4.2），新增编译项逐项隔离，`compile_mode=default`。
+
+每轮独立进程，运行 80 步；前 20 步预热，统计第 21-80 步。关闭 Profiler、数值检查及模型保存。吞吐为 `1920 / max_rank(sum(step_seconds[20:80]))`；每步先取 8 rank 最大主机墙钟耗时，再计算中位数和 P90。首步包含数据、首次执行和编译成本，不是纯编译时间；显存峰值包含预热。
+
+本节使用本次单轮 baseline **107.568 samples/s** 计算相对变化，与第五章 2026-10-16 的三轮 Baseline **106.071 samples/s** 分开记录。基线与候选顺序运行、时间不同，差值只作诊断参考；不据此宣布统计显著或推荐正式启用。
+
+### 6.3 已确认结果与状态
+
+8 卡、全局 batch 32；`model_vl` 和 `blocks_vl` 分别组合 VL 与整体 DiT、逐块 DiT 编译，其余候选为单项隔离测速。`text_v2` 数据为无效轮次的诊断中位数。
+
+| 方案 | 有效/计划轮次 | 吞吐 samples/s | 相对基线 | 中位/P90 ms | 首步 s | 峰值 allocated/reserved GiB | 跨轮 CV | 状态 |
+| --- | ---: | ---: | ---: | --- | ---: | --- | ---: | --- |
+| baseline | 1/1 | 107.568 | - | 297.021/300.405 | 81.651 | 10.318/12.924 | - | 有效 |
+| DiT blocks | 3/3 | 115.626 | +7.491% | 276.129/280.809 | 111.000 | 10.318/13.082 | 0.428% | 有效 |
+| DiT model | 3/3 | 119.110 | +10.730% | 268.583/271.304 | 163.739 | 11.458/14.682 | 0.873% | 有效 |
+| DiT model + VL | 3/3 | 119.301 | +10.907% | 266.658/270.378 | 469.480 | 11.459/14.682 | 0.617% | 有效（组合） |
+| DiT blocks + VL | 1/1 | 115.469 | +7.345%* | 277.094/280.457 | 434.414* | 10.318/13.082 | - | 有效稳态（组合） |
+| VL | 3/3 | 108.817 | +1.161% | 293.154/299.732 | 106.650 | 10.318/12.924 | 0.446% | 有效 |
+| text_v2* | 0/3 | 78.438 | -27.080%* | 296.660/304.343 | 92.494 | 10.318/12.924 | 0.434% | 无效 |
+
+除 text_v2 和 blocks_vl 外，数值取有效轮次统计中位数，显存取各轮峰值。`text_v2*` 的数值是三轮实测中位数，仅作诊断；三轮前后窗口趋势均超过 5%，不纳入有效性能比较。单项数据来源及逐轮记录见 [编译测速报告](/workspace/data/outputs/compile-benchmark-20261019-123217-supplement-F/benchmark_report.md)。`model_vl` 数据来自 [三轮原始记录](/workspace/data/outputs/compile-bench-model_vl-20261020-144047-2451242/)：各轮吞吐为 119.301、118.261、120.057 samples/s，前后窗口趋势分别为 -0.292%、+3.627%、-0.828%；8 个 rank 均完成 80 步。`blocks_vl` 的稳态指标取 [热缓存单轮复测](/workspace/data/outputs/compile-bench-blocks-vl-warm-20261021-020008/benchmark_report.md)；标 * 的首步 434.414 s 取 [上次采集轮次](/workspace/data/outputs/compile-bench-paired-once-20261021-012636/benchmark_report.md)，该轮因后段尖峰未通过稳态门槛。`blocks_vl` 与表中基线的相对变化跨时段、跨缓存条件，仅供诊断，不代表受控加速对照。
+> 数据结论：单项中整体 DiT 编译吞吐最高（119.110 samples/s，较本轮 baseline +10.730%）；逐块编译为 +7.491%，VL 为 +1.161%。组合方案比单独整体 DiT 高约 0.160%，小于组合三轮吞吐的 0.617% 跨轮波动，尚不能确认叠加 VL 带来额外收益；其首步中位数为 469.480 秒，包含编译与实际执行。
+ `text_v2` 三轮均未通过稳态门槛，不能据其原始吞吐判断真实性能。

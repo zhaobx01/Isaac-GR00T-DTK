@@ -446,35 +446,17 @@ class Qwen3Backbone(torch.nn.Module):
         On torch>=2.9 (cuDNN 9.10.x) the contiguous bf16 patch-embed ``Conv3d``
         dispatches to a pathologically slow kernel on sm_80; ``channels_last_3d``
         selects the fast one and is numerically equivalent (harmless elsewhere).
+
+        Enabled by default; set ``GR00T_VISION_PATCH_EMBED_CHANNELS_LAST=0`` and restart
+        to keep the default layout. See ``gr00t.Replacement.vision_patch_embed_layout``.
         """
         visual = getattr(self.model, "visual", None)
         if visual is None:
             return
 
-        def _to_channels_last_3d(_module, inputs):
-            # Skip while tracing: the legacy TorchScript ONNX exporter cannot lower a
-            # memory_format on .contiguous() ("onnx memory_format support is not
-            # implemented"). This is a runtime-only perf hint, so the plain contiguous
-            # graph is numerically equivalent for export.
-            if not inputs or torch.jit.is_tracing():
-                return inputs
-            x = inputs[0]
-            if isinstance(x, torch.Tensor) and x.dim() == 5:
-                return (x.contiguous(memory_format=torch.channels_last_3d), *inputs[1:])
-            return inputs
+        from gr00t.Replacement import vision_patch_embed_layout
 
-        patched = 0
-        for module in visual.modules():
-            if isinstance(module, torch.nn.Conv3d):
-                module.to(memory_format=torch.channels_last_3d)
-                module.register_forward_pre_hook(_to_channels_last_3d)
-                patched += 1
-        if patched:
-            logger.debug(
-                "Applied channels_last_3d to %d vision patch-embed Conv3d module(s) "
-                "(torch>=2.9 cuDNN Conv3d perf workaround).",
-                patched,
-            )
+        vision_patch_embed_layout.apply(visual)
 
     def set_trainable_parameters(self, tune_llm: bool, tune_visual: bool, tune_top_llm_layers: int):
         self.tune_llm = tune_llm

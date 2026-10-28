@@ -2,6 +2,9 @@
 
 set -x -euo pipefail
 
+# Reuse framework-default compilation caches, including when called directly.
+unset TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR
+
 NUM_GPUS="${NUM_GPUS:-1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 SAVE_STEPS="${SAVE_STEPS:-1000}"

@@ -72,6 +72,52 @@ class ProfCallback(TrainerCallback):
         self.prof.step()
 
 
+class StepMetricsCallback(TrainerCallback):
+    """Record per-step host wall time and peak device memory for each rank.
+
+    Step ``i`` spans from the end of step ``i-1`` (or train begin) to the end of
+    step ``i``, so it includes data fetching. No extra device synchronization is
+    added; the JSON is written once at train end to ``out_dir/rank-XX.json``.
+    """
+
+    def __init__(self, out_dir, run_info: Optional[dict] = None):
+        self.out_dir = out_dir
+        self.run_info = dict(run_info or {})
+        self.step_seconds: list[float] = []
+        self._last = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        self._last = time.perf_counter()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        now = time.perf_counter()
+        self.step_seconds.append(now - self._last)
+        self._last = now
+
+    def on_train_end(self, args, state, control, **kwargs):
+        import json
+        from pathlib import Path
+
+        memory = {}
+        if torch.cuda.is_available():
+            memory = {
+                "max_memory_allocated_bytes": torch.cuda.max_memory_allocated(),
+                "max_memory_reserved_bytes": torch.cuda.max_memory_reserved(),
+            }
+        out_dir = Path(self.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "rank": args.process_index,
+            "world_size": args.world_size,
+            "run_info": self.run_info,
+            "step_seconds": self.step_seconds,
+            **memory,
+        }
+        (out_dir / f"rank-{args.process_index:02d}.json").write_text(json.dumps(payload, indent=2))
+
+
 class _BatchIterator:
     """Lightweight iterator that yields pre-collated batches."""
 
