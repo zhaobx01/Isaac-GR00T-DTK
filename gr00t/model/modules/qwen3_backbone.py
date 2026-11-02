@@ -273,48 +273,6 @@ def _cpu_get_rope_index(
     return position_ids.to(output_device), rope_deltas.to(output_device)
 
 
-def _compile_qwen3_vision_block_classes(visual: torch.nn.Module) -> int:
-    """Apply the local Qwen3-VL VisionBlock ``torch.compile`` override."""
-    compiled = 0
-    block_classes = {type(block) for block in getattr(visual, "blocks", ())}
-    for block_class in block_classes:
-        block_call = getattr(block_class, "__call__", None)
-        if block_call is None or hasattr(block_call, "_torchdynamo_orig_callable"):
-            continue
-        # This is equivalent to decorating Qwen3VLVisionBlock itself with
-        # @torch.compile(...). torch.compile installs an optimized __call__ on the
-        # class, so it also applies to instances that were already constructed.
-        torch.compile(block_class, mode="max-autotune-no-cudagraphs")
-        compiled += 1
-    return compiled
-
-
-def _disable_transformers_flash_attention_for_dynamo(
-    flash_attention_module=None,
-    attention_functions=None,
-) -> bool:
-    """Move the local ``@torch._dynamo.disable`` FlashAttention override in-repo."""
-    if flash_attention_module is None or attention_functions is None:
-        from transformers.integrations import flash_attention as flash_attention_module
-        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS as attention_functions
-
-    original = flash_attention_module.flash_attention_forward
-    already_disabled = hasattr(original, "_torchdynamo_disable")
-    disabled = original if already_disabled else torch._dynamo.disable(original)
-    flash_attention_module.flash_attention_forward = disabled
-
-    # AttentionInterface stores function objects in a registry. Updating only the
-    # integration module would leave Qwen3-VL calling the old reference.
-    for implementation in ("flash_attention_2", "flash_attention_3"):
-        try:
-            registered = attention_functions[implementation]
-        except KeyError:
-            continue
-        if registered is original:
-            attention_functions.register(implementation, disabled)
-    return not already_disabled
-
-
 class Qwen3Backbone(torch.nn.Module):
     def __init__(
         self,
@@ -395,22 +353,13 @@ class Qwen3Backbone(torch.nn.Module):
         # thousands of synchronous scalar DtoH copies per forward.
         self._apply_cpu_position_preprocessing()
 
-        # Keep local performance/compiler workarounds independent of site-packages.
-        self._apply_transformers_compilation_overrides()
+        # Shared training/inference baseline compiler setup lives in Replacement.
+        from gr00t.Replacement.model_compile import install_baseline_overrides
+
+        install_baseline_overrides(self)
 
         # Restore the fast vision patch-embed kernel on torch>=2.9. See method docstring.
         self._apply_vision_patch_embed_channels_last()
-
-    def _apply_transformers_compilation_overrides(self) -> None:
-        """Install repository-owned Qwen3-VL compile/Dynamo overrides."""
-        compiled_blocks = _compile_qwen3_vision_block_classes(self.model.visual)
-        flash_disabled = _disable_transformers_flash_attention_for_dynamo()
-        logger.debug(
-            "Applied Qwen3-VL compilation overrides (compiled_block_classes=%d, "
-            "flash_attention_newly_disabled=%s).",
-            compiled_blocks,
-            flash_disabled,
-        )
 
     def _apply_cpu_position_preprocessing(self) -> None:
         """Install sync-free CPU metadata builders on this Transformers instance."""

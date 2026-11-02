@@ -93,9 +93,24 @@ def test_same_bucket_reuses_compiled_graph_for_distinct_sequence_lengths():
 def test_opt_in_rejects_legacy_or_incomplete_compile_scopes():
     with pytest.raises(ValueError, match="legacy"):
         sequence_buckets.validate_activation("dynamic-buckets", False, "off", {"whole": True})
-    with pytest.raises(ValueError, match="dit-model-vl"):
-        sequence_buckets.validate_activation("dynamic-buckets", False, "vl", None)
+    for variant in ("off", "dit-blocks", "text-layers", "text-forwards"):
+        with pytest.raises(ValueError, match="require one of"):
+            sequence_buckets.validate_activation("dynamic-buckets", False, variant, None)
+        with pytest.raises(ValueError, match="require one of"):
+            sequence_buckets.validate_activation("auto", True, variant, None)
+    for variant in ("vl", "dit-model", "dit-model-vl"):
+        sequence_buckets.validate_activation("dynamic-buckets", False, variant, None)
+        sequence_buckets.validate_activation("auto", True, variant, None)
     sequence_buckets.validate_activation("auto", False, "off", {"whole": True})
+
+
+@pytest.mark.parametrize("policy", ["pad-152-156", "pad-156"])
+@pytest.mark.parametrize("variant", [
+    "off", "vl", "dit-model", "dit-model-vl", "dit-blocks", "text-layers", "text-forwards",
+])
+def test_fixed_padding_allowed_with_any_compile_variant(policy, variant):
+    sequence_buckets.validate_activation(policy, False, variant, None)
+    sequence_buckets.validate_activation(policy, False, "off", {"whole": True})
 
 
 def test_diagnostics_record_original_batch_shape_and_exact_step(tmp_path):

@@ -465,7 +465,7 @@ rank 0 的 `key_averages()` 表位于终端和 `train.log`，表示算子自身�
 | --- | --- |
 | [Baseline Trace 清单](../../data/benchmarks/baseline/reference/metadata/trace_sha256.json) | 同一次采集的八 rank 原始 JSON |
 | [Baseline Trace 分析](../../data/benchmarks/baseline/reference/trace-analysis/README.md) | profile-model 方法的算子、kernel、搬运统计及 HTA 结果；附可指定输入、输出目录的复算命令 |
-| [DiT model + VL Trace 与分析入口](../../data/benchmarks/optimizations/model-vl/trace-analysis/README.md) | 组合方案的 Trace 位置与分析脚本说明 |
+| [DiT model + VL Trace 与分析入口](../../data/benchmarks/optimizations/torch-compile/model-vl/trace-analysis/README.md) | 组合方案的 Trace 位置与分析脚本说明 |
 
 Trace 与搬运统计不等于显存快照；窗口空档与 HTA idle 定义不同，需分别标明分母和计算口径。统计方法见 5.3。
 
@@ -645,12 +645,75 @@ printf '分析输出：%s\n' "$analysis_dir"
 
 当前启动脚本和实验编排器统一清除 `TORCHINDUCTOR_CACHE_DIR`、`TRITON_CACHE_DIR`，使用框架默认路径并保留缓存以供复用，不再为每轮创建独立编译缓存。缓存命中可减少重复编译，但不能消除输入形状变化等原因触发的重编译。历史结果的原始采集条件以对应归档为准，本次修改不重算历史数据。
 
-> 当前入口：已恢复 `gr00t/experiment/compilation.py`、6.1 的旧 CLI 字段及训练调用链，6.2／6.3 脚本可使用这些参数。环境变量入口 `GR00T_COMPILE_VARIANT=off|vl|dit-model|dit-model-vl` 仍保留，默认 `off`；启用旧 CLI 编译项时应将它设为 `off`，两种入口同时启用会报错。两者均保留原视觉 Block 编译。未恢复文本实验的 `use_cache=False` 改动；恢复入口不代表文本编译已重新通过 GPU 验收。批量采集编排脚本（原 `scripts/zero2_comm_experiment/`、`scripts/compile_sequence/`）已随优化结束移除，需要复算时使用各归档内的 `source-snapshot/scripts/`。
+> 当前入口：已恢复 `gr00t/experiment/compilation.py`、6.1 的旧 CLI 字段及训练调用链，6.2／6.3 脚本可使用这些参数。环境变量入口 `GR00T_COMPILE_VARIANT` 默认 `off`，支持 `vl`、`dit-model`、`dit-model-vl`、`dit-blocks`、`text-layers`、`text-forwards`；启用旧 CLI 编译项时应将它设为 `off`，两种入口同时启用会报错。两者均保留原视觉 Block 编译。未恢复文本实验的 `use_cache=False` 改动；恢复入口不代表文本编译已重新通过 GPU 验收。批量采集编排脚本（原 `scripts/zero2_comm_experiment/`、`scripts/compile_sequence/`）已随优化结束移除，需要复算时使用各归档内的 `source-snapshot/scripts/`。
 
 
 ### 6.1 编译范围与选择
 
 本节介绍可选的新增编译范围。它们默认关闭；关闭这些开关不会关闭已有的视觉 Block 编译。新增编译均使用 `fullgraph=False`，`dynamic` 保持 PyTorch 默认设置。
+
+**默认基线的两个独立开关。** 视觉 Block 编译和 FlashAttention Dynamo 边界隔离的实现均位于 `gr00t/Replacement/model_compile.py`。骨干构造时只委托调用 `install_baseline_overrides(self)`，因此直接构造骨干、训练、推理和评估均保持原有默认行为。
+
+| 环境变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `GR00T_COMPILE_VISION_BLOCKS` | `1` | 按视觉 Block 类编译，固定使用 `max-autotune-no-cudagraphs` |
+| `GR00T_FLASH_ATTN_DYNAMO_DISABLE` | `1` | 在 FlashAttention 集成函数外安装 Dynamo disable 包装，并更新仍指向原函数的 FA2/FA3 注册引用 |
+
+两变量仅接受 `0/1`，与 `GR00T_COMPILE_VARIANT` 和旧 CLI 编译参数独立。`GR00T_COMPILE_VARIANT=off` 仅关闭新增 DiT/VL/文本编译；`GR00T_COMPILE_MODE` 不影响基线视觉编译的固定模式。边界隔离不会关闭 FlashAttention，关闭视觉编译也不会关闭 `channels_last_3d` 布局。
+
+```bash
+# 默认启动：两项均开启，也可显式写出
+GR00T_COMPILE_VISION_BLOCKS=1 GR00T_FLASH_ATTN_DYNAMO_DISABLE=1 bash start.sh
+
+# 分别关闭，每条命令使用新的训练进程
+GR00T_COMPILE_VISION_BLOCKS=0 bash start.sh
+GR00T_FLASH_ATTN_DYNAMO_DISABLE=0 bash start.sh
+
+# 同时关闭
+GR00T_COMPILE_VISION_BLOCKS=0 GR00T_FLASH_ATTN_DYNAMO_DISABLE=0 bash start.sh
+```
+
+视觉编译会修改类调用，FlashAttention 包装会修改当前进程的函数和注册引用。第一次配置完成后，任何开关变化均须启动新进程；重复安装相同配置保持幂等，新视觉类按同一配置安装。安装前检查所有目标和包装归属；无法确认归属或已有包装被改动时明确报错，不覆盖外来包装。安装中途失败后同样要求重启，不在运行中撤销全局修改。CPU 位置处理、模型权重、精度和 `use_cache` 不由这两个开关改变。
+
+训练会在所有 variant（包括 `off` 和旧 CLI）下单独写出 `compilation/baseline-rank-XX.json`，并在逐步指标的 `run_info.baseline_compile` 中保存请求值与安装状态。推理和直接构造骨干输出同样的安装日志。`installation_only=true` 表示构造时的包装安装记录，不代表目标已编译执行或取得提速。
+
+40 步测速脚本在 `DEFAULTS` 中显式将两项设为 `1`，所有 CASE 均继承，未增加关闭对照 CASE。可先使用 `--dry-run` 核对启动配置。本次仅进行 CPU 测试与入口验证，未运行新的八卡性能或训练数值验收。
+
+**Replacement 环境变量入口。** `gr00t/Replacement/model_compile.py` 通过 `GR00T_COMPILE_VARIANT` 选择下列范围，旧 CLI 实现仍单独保留。一次只选择一个值；本次不增加逐块或文本模式的组合值。
+
+| 环境变量值 | 编译范围 | 调用边界 |
+| --- | --- | --- |
+| `off` | 不新增编译包装 | 保留基线视觉 Block 编译 |
+| `vl` | 动作头 VL 自注意力 4 块 | 模块实例 |
+| `dit-model` | 整体动作 DiT | 模块实例 |
+| `dit-model-vl` | 整体动作 DiT + VL 自注意力 4 块 | 模块实例 |
+| `dit-blocks` | 动作 DiT 的 32 块 | 各模块实例 |
+| `text-layers` | 保留的文本 Decoder 16 层 | 各模块实例 |
+| `text-forwards` | 保留的文本 Decoder 16 层的 `forward` | 同一层类型共享编译函数，再分别绑定实例 |
+
+```bash
+GR00T_COMPILE_VARIANT=dit-blocks bash start.sh    # DiT 逐块
+GR00T_COMPILE_VARIANT=text-layers bash start.sh   # 文本完整层
+GR00T_COMPILE_VARIANT=text-forwards bash start.sh # 文本 forward
+```
+
+`GR00T_COMPILE_MODE` 默认 `default`，可设置为当前 Inductor 支持的其他模式。切换范围、模式或关闭已安装包装都需要启动新进程；安装失败后不得复用该模型。安装前检查全部目标的数量、类型和已有包装，校验失败不修改模型。两种文本模式均不修改 `use_cache`、精度或冻结状态。`text-layers` 可能把 Transformers 隐藏状态捕获包装纳入编译，在真实训练中可能命中重编译上限并发生框架回退；`text-forwards` 将该捕获逻辑保留在外层 eager，但仍不保证所有输入均能复用同一张图。
+
+文本 `forward` 采用运行时绑定，不能依赖对整个模型对象做 pickle；应保存 `state_dict`，在新建模型加载后重新安装编译。Transformers 输出捕获若异常退出，也应丢弃该模型并启动新进程。序列补齐与长度诊断仍仅允许原有 `dit-model-vl` 范围。
+
+每 rank 的 `compilation/rank-XX.json` 保留 `paths`，新增 `boundaries` 记录每个目标的 `module` 或 `forward` 边界。`installation_only=true` 仅说明安装包装；训练结束的 `compiled_callables_present` 检查对应边界的包装是否仍存在，图与 kernel 计数属于整个进程（含基线视觉编译），不能据此断言某一目标成功编译或获得提速。`GR00T_COMPILE_TRACE_MARKERS=1` 可对两种边界分别增加 `gr00t_compile::<path>` 标注。
+
+**40 步独立测速入口。** 当前工作区脚本新增 `dit_blocks`、`text_layers`、`text_forwards` 三项，保留已有单项与组合项。使用已配置依赖且可访问八卡的环境运行：
+
+```bash
+python3 /workspace/scripts/benchmark_all/benchmark.py \
+  --output "/workspace/data/outputs/compile-scopes-$(date +%Y%m%d-%H%M%S)" \
+  --cases baseline dit_blocks text_layers text_forwards
+```
+
+默认每项两轮、每轮 40 步；第 35 步和第 31–40 步平均耗时分别输出对比表，沿用脚本原有有效性规则；每轮启动前每 10 秒检查八卡，仅在每张卡显存利用率均低于 2% 时放行。等待期间打印八卡平均已用显存、平均显存利用率及平均 GPU 利用率，GPU 利用率不参与启动判断。若全部 CASE 启用，共 15 项、30 次训练。编译模式沿用脚本默认设置；框架默认磁盘缓存跨轮保留。该入口提供测速条件，不等于已完成新增模式的设备性能或训练数值验收。
+
+**原 CLI 入口及历史实验脚本：** 下表的 `VARIANT` 是示例脚本变量，与上述环境变量值分别解释。
 
 | VARIANT | 开关 | 编译目标 | 可用示例 |
 | --- | --- | --- | --- |
@@ -837,7 +900,7 @@ export GR00T_COMPILE_VARIANT=off          # 关闭新增编译，保留原视觉
 | VL | 108.679 | 108.232 | 109.718 | 108.679 | +2.10% | 三轮 |
 | text_v2 | 107.416 | 108.965 | 104.339 | 107.416 | +0.91% | 原验收三轮均无效，仅作诊断 |
 
-吞吐单位为 samples/s。末 10 步复算不改变原实验的有效性判定，也不包含窗口外的编译停顿；相对基线为跨批次参考。参见[基线原始数据](../../data/benchmarks/baseline/reference/speed/)、[编译实验逐 rank 逐步数据](../../data/benchmarks/comparisons/compile/speed/analysis/results/per_step.csv)与[原实验报告](../../data/benchmarks/comparisons/compile/reports/benchmark_report.md)。
+吞吐单位为 samples/s。末 10 步复算不改变原实验的有效性判定，也不包含窗口外的编译停顿；相对基线为跨批次参考。
 ### 6.5 重编译优化
 
 #### 6.5.1 Cosmos3：对长度参数分桶
@@ -889,6 +952,8 @@ export GR00T_COMPILE_SEQUENCE_POLICY=pad-156      # 单桶
 export GR00T_COMPILE_SEQUENCE_POLICY=auto         # 回退原补齐，默认
 ```
 
+**与编译项的组合范围。** 两种补齐策略在训练器输入处补齐 `input_ids` 和 `attention_mask`，不依赖编译产物，可与任意 `GR00T_COMPILE_VARIANT`（含 `off`）及旧 CLI 编译项组合。`GR00T_COMPILE_SEQUENCE_POLICY=dynamic-buckets` 和 `GR00T_COMPILE_LENGTH_DIAGNOSTICS=1` 需要包装已编译的 VL／DiT 可调用对象，仅支持 `vl`、`dit-model`、`dit-model-vl`，不支持旧 CLI、`dit-blocks`、`text-layers`、`text-forwards` 和 `off`，配置不符时启动即报错。只开 `vl` 或 `dit-model` 时，分桶配置须包含对应目标（`vl`／`dit`）。补齐与 `dit-blocks`、`text-*` 的组合尚未做 GPU 测速，补齐的数值等价性也未验证。
+
 #### 6.5.4 实验结果
 
 四卡（物理 GPU 4–7）、全局 batch 768、每卡 192；各组均使用 DiT model＋VL 编译，运行 80 步。吞吐统计第 71–80 步，以最慢 rank 的累计耗时计算。
@@ -901,15 +966,9 @@ export GR00T_COMPILE_SEQUENCE_POLICY=auto         # 回退原补齐，默认
 
 表中吞吐单位均为 samples/s。末10步为第71–80步；第20–80步共61步，按最慢 rank 的累计计时计算，保留该窗口中的编译及重编译停顿。各轮复用框架默认编译缓存，运行顺序可能影响编译耗时。
 
-重编译次数为四 rank 全程 1–80 步的合计，不包含首次编译；第 71–80 步各组均无重编译。基线在完成第 24 步后，rank 2 因长度 156→155 触发 VL 和 DiT 各一次重编译，第 25 个计时区间约 101.9 秒。表中末尾窗口不包含这段代价，因此它反映的是后段速度，不代表包含编译停顿的全程表现。
+重编译次数为四 rank 全程 1–80 步的合计，不包含首次编译；本轮固定补齐任务在观察范围 80 步内没有记录重编译，避免了基线中出现的长度失配；但和实际出现的形状，并不能保证其他输入也不会重编译。两种策略的后段吞吐都未超过本次基线，默认仍为 `auto`。
 
-双桶的 152 桶使用次数为 0／640，实际均使用 156。每卡 batch 为 192 时，只要其中一个样本长度超过 152，整个 batch 就会选择 156；本次尚未验证短桶复用或计算收益。双桶两轮波动较大，不能将两种候选的吞吐差异直接归因于桶策略。
-
-本轮固定补齐任务没有记录重编译，避免了基线中出现的长度失配；但观察范围只有 80 步和实际出现的形状，并不能保证其他输入也不会重编译。两种策略的后段吞吐都未超过本次基线，默认仍为 `auto`。
-
-详见[实验报告](../../data/benchmarks/optimizations/torch-compile-padding-4gpu-20261028/report.md)、[基线 guard 日志](../../data/benchmarks/optimizations/torch-compile-padding-4gpu-20261028/baseline/recompiles-guards.txt)和[单桶四 rank Trace](../../data/benchmarks/optimizations/torch-compile-padding-4gpu-20261028/trace/profiling/)。
-
-**八卡补齐策略实验（2026-10-28）。** 全局 batch 768、每卡96；各组80步。表中吞吐单位为 samples/s，统计口径与上表相同。
+**八卡补齐策略实验**。 全局 batch 768、每卡96，各组80步。表中吞吐单位为 samples/s，统计口径与上表相同。
 
 | 策略 | 末10步第1轮 | 末10步第2轮 | 末10步平均 | 相对基线 | 第20–80步第1轮 | 第20–80步第2轮 | 全程重编译次数 |
 |---|---:|---:|---:|---:|---:|---:|---|
@@ -917,15 +976,11 @@ export GR00T_COMPILE_SEQUENCE_POLICY=auto         # 回退原补齐，默认
 | 双桶152／156 | 628.432 | 628.014 | 628.223 | -0.48% | 628.029 | 630.668 | 0／0 |
 | 单桶156 | 631.754 | 634.454 | 633.104 | 0.29% | 630.892 | 632.813 | 0／0 |
 
-双桶152使用 0/1280 个已记录 rank-batch，短桶未覆盖。基线仅一轮，且本次未验证 padding 数值等价。八卡每卡96，四卡每卡192，跨卡数结果不直接归因于桶策略。
-
-详见[八卡实验报告](../../data/benchmarks/optimizations/torch-compile-padding-8gpu-20261028/report.md)和[原始归档](../../data/benchmarks/optimizations/torch-compile-padding-8gpu-20261028/)。
+双桶152使用 0/1280 个已记录 rank-batch，短桶未覆盖。基线仅一轮，且本次未验证 padding 数值等价。八卡每卡96，四卡每卡192，跨卡数结果不直接归因于桶策略。详见[八卡实验报告](../../data/benchmarks/optimizations/torch-compile/fixed-sequence-padding-8gpu/report.md)和[原始归档](../../data/benchmarks/optimizations/torch-compile/fixed-sequence-padding-8gpu/)。
 
 ## 七、ZeRO-2 通信优化
 
-本章比较 Gradient Reduction Overlap（GRO）、Owner-based Reduction（OBR）及 AllGather 流水。算法优化默认关闭，吞吐计时器使用 DeepSpeed 原始行为；适配只作用于当前实例，不修改厂商安装文件。
-
-归档中的原始配置代号与本文名称对应：E0 为 Baseline（BASE），A 为 Gradient Reduction Overlap（GRO），B 为 Owner-based Reduction（OBR）。原始任务标识保留不变。
+本章比较 Gradient Reduction Overlap（GRO）、Owner-based Reduction（OBR）及 AllGather 流水。
 
 ### 7.1 总览
 
@@ -934,16 +989,14 @@ export GR00T_COMPILE_SEQUENCE_POLICY=auto         # 回退原补齐，默认
 | 配置 | 优化内容 | 吞吐 samples/s | 相对 BASE | 轮数 | 结论 |
 |---|---|---:|---:|---:|---|
 | Baseline（BASE） | 原厂 ZeRO-2 梯度通信与参数更新路径 | 584.229 | 0.00% | 2 | 基线 |
-| Gradient Reduction Overlap（GRO） | 用缓冲区 Event 依赖替代计算流逐桶等待 | 603.372 | **+3.28%** | 2 | **通过原实验验收，推荐** |
+| Gradient Reduction Overlap（GRO） | 用缓冲区 Event 依赖替代计算流逐桶等待 | 603.372 | **+3.28%** | 2 | **推荐** |
 | Owner-based Reduction（OBR） | 按梯度 owner 选择定向 Reduce 或 ReduceScatter | 584.068 | −0.03% | 1 | 首轮未改善 |
 | AllGather 流水 | 分组更新参数并异步聚合，重叠 AdamW 与 AllGather | 586.765 | +0.43% | 1 | 跨批次参考对比 |
 
 本表统一统计每轮第 71–80 步。每轮吞吐按 `768 × 10 / max_rank(第71–80步累计耗时)` 计算；两轮取吞吐中位数。AllGather 为跨批次单轮比较，可能受外部任务影响。
-
-
 ### 7.2 实验口径与前提
 
-本章吞吐对比统一按每轮第 71–80 步重新计算；原实验的稳态与验收仍按第 21–100 步执行。
+本章吞吐对比统一按每轮第 71–80 步重新计算。
 
 | 项目 | 配置 |
 |---|---|
@@ -1086,14 +1139,16 @@ bash start.sh
 
 | 内容 | 入口 |
 |---|---|
-| 主实验：BASE/GRO/OBR | [命名汇总](../../data/benchmarks/zero2-communication/gradient/base-gro-obr-b768-20261026/reports/named-summary.md)、[逐轮展示数据](../../data/benchmarks/zero2-communication/gradient/base-gro-obr-b768-20261026/reports/named-rounds.csv)、[原始报告](../../data/benchmarks/zero2-communication/gradient/base-gro-obr-b768-20261026/reports/report.md)、[验收](../../data/benchmarks/zero2-communication/gradient/base-gro-obr-b768-20261026/reports/acceptance.json)、[原始逐轮数据](../../data/benchmarks/zero2-communication/gradient/base-gro-obr-b768-20261026/reports/rounds.csv) |
-| batch 768 仅 AllGather 流水后续测速 | [586.765 测速报告](../../data/benchmarks/zero2-communication/allgather/speed-b32-b768-20261027/report.md) |
-| batch 768 仅 AllGather 流水历史实验 | [报告](../../data/benchmarks/zero2-communication/allgather/b768-20261027/reports/report.md)、[八 rank 区间分析](../../data/benchmarks/zero2-communication/allgather/b768-20261027/trace-analysis/pipeline/summary.json) |
-| batch 32 AllGather 流水 | [报告](../../data/benchmarks/zero2-communication/allgather/b32-20261022/reports/retest_report.md)、[区间对照](../../data/benchmarks/zero2-communication/allgather/b32-20261022/trace-analysis/comparison/optimizer-comparison.csv) |
+| 主实验：BASE/GRO/OBR | [命名汇总](../../data/benchmarks/optimizations/zero2-communication/gradient/base-gro-obr-b768-20261026/reports/named-summary.md)、[逐轮展示数据](../../data/benchmarks/optimizations/zero2-communication/gradient/base-gro-obr-b768-20261026/reports/named-rounds.csv)、[原始报告](../../data/benchmarks/optimizations/zero2-communication/gradient/base-gro-obr-b768-20261026/reports/report.md)、[验收](../../data/benchmarks/optimizations/zero2-communication/gradient/base-gro-obr-b768-20261026/reports/acceptance.json)、[原始逐轮数据](../../data/benchmarks/optimizations/zero2-communication/gradient/base-gro-obr-b768-20261026/reports/rounds.csv) |
+| batch 768 仅 AllGather 流水后续测速 | [586.765 测速报告](../../data/benchmarks/optimizations/zero2-communication/allgather/speed-b32-b768-20261027/report.md) |
+| batch 768 仅 AllGather 流水历史实验 | [报告](../../data/benchmarks/optimizations/zero2-communication/allgather/b768-20261027/reports/report.md)、[八 rank 区间分析](../../data/benchmarks/optimizations/zero2-communication/allgather/b768-20261027/trace-analysis/pipeline/summary.json) |
+| batch 32 AllGather 流水 | [报告](../../data/benchmarks/optimizations/zero2-communication/allgather/b32-20261022/reports/retest_report.md)、[区间对照](../../data/benchmarks/optimizations/zero2-communication/allgather/b32-20261022/trace-analysis/comparison/optimizer-comparison.csv) |
 
-## 八、内存布局优化
+## 八、其他通用优化
 
-### 8.1 优化内容与开关
+### 8.1 内存布局优化
+
+#### 8.1.1 优化内容与开关
 
 `Qwen3Backbone` 初始化时，可将视觉模块中的 `Conv3d` 权重转换为 PyTorch 的 `channels_last_3d` 内存布局，并安装前置 hook，把五维输入转换为同一布局；其他维度的输入不转换，tracing 时跳过输入转换。实现见 [vision_patch_embed_layout.py](../gr00t/Replacement/vision_patch_embed_layout.py)。
 
@@ -1117,11 +1172,7 @@ for module in visual.modules():
         module.register_forward_pre_hook(convert_input)
 ```
 
-权重的逻辑形状仍是 `[输出通道, 输入通道, 深度, 高, 宽]`；转换改变的是内存中的排列与 stride，让输入通道在内存中相邻，并不改变卷积的维度定义。输入同样保留 `[批次, 通道, 深度, 高, 宽]` 的逻辑形状。
-
-环境变量 `GR00T_VISION_PATCH_EMBED_CHANNELS_LAST` 默认是 `1`，设为 `0` 则在新建模型时跳过权重转换和 hook 安装。只接受 `0` 或 `1`，其他值会报错。开关在构建模型时读取，切换后需重启进程；已经转换的权重不会在同一进程内自动还原。
-
-启动训练前启用或回退：
+环境变量 `GR00T_VISION_PATCH_EMBED_CHANNELS_LAST` 默认是 `1`，设为 `0` 则在新建模型时跳过权重转换和 hook 安装。启动训练前启用或回退：
 
 ```bash
 # 启用；未设置时也默认启用
@@ -1133,7 +1184,7 @@ export GR00T_VISION_PATCH_EMBED_CHANNELS_LAST=0
 
 `PYTORCH_MIOPEN_SUGGEST_NHWC` 和 `MIOPEN_FIND_MODE` 是独立的后端设置。未设置表示保留后端默认行为，不等于强制关闭布局建议；不需要设置它们才能使用上述布局开关。下面 C、D 组分别用于观察显式设置后的结果，不能由变量值直接推断后端实际选择的 kernel 或是否触发搜索。
 
-### 8.2 测速口径与结果
+#### 8.1.2 测速口径与结果
 
 两组 batch 的测试均使用 8 卡、100 步、BF16、ZeRO-2、`adamw_torch`、梯度累积 1，关闭 profiler、数值扫描和模型保存。吞吐取第 **21–30 步**，对每个 rank 累计 10 步耗时后取最大值：
 
@@ -1147,9 +1198,9 @@ samples/s = global_batch_size × 10 / max_rank(sum(step_seconds[20:30]))
 
 | 组别 | 布局开关 | `PYTORCH_MIOPEN_SUGGEST_NHWC` | `MIOPEN_FIND_MODE` | 各轮 samples/s | 中位数 samples/s | 相对前一组 |
 |---|---:|---|---|---|---:|---:|
-| A | 0 | 未设置 | 未设置 | 393.82、393.10、395.6 | 393.82 | — |
-| B | 1 | 未设置 | 未设置 | 581.09、586.31 | 583.70 | +48.22% |
-| C | 1 | 1 | 未设置 | 588.67、585.49 | 587.08 | +0.58% |
+| A | 0 | - | -| 393.82、393.10、395.6 | 393.82 | — |
+| B | 1 | -| -| 581.09、586.31 | 583.70 | +48.22% |
+| C | 1 | 1 | -| 588.67、585.49 | 587.08 | +0.58% |
 | D | 1 | 1 | 1 | 591.43、590.65 | 591.04 | +0.68% |
 
 **全局 batch 32**：A、B 各一轮，结果仅作单轮参考。
@@ -1159,9 +1210,9 @@ samples/s = global_batch_size × 10 / max_rank(sum(step_seconds[20:30]))
 | A | 0 | 未设置 | 99.13 | — |
 | B | 1 | 未设置 | 107.39 | +8.33% |
 
-### 8.3 验证范围与归档
+#### 8.1.3 验证范围与归档
 
-现有 [CPU 测试](../tests/gr00t/Replacement/test_vision_patch_embed_layout.py)覆盖默认和非法开关、权重及输入布局、前向输出和梯度一致性、tracing 跳过、重复安装和 `Qwen3Backbone` 方法。实际训练 checkpoint 的保存与加载、ZeRO-3 是否保持权重布局、视觉 ONNX 导出到 TRT，以及长期训练尚未专项验证；上述吞吐实验也不构成数值等价或长期稳定性证明。
+现有 [CPU 测试](../tests/gr00t/Replacement/test_vision_patch_embed_layout.py)覆盖默认和非法开关、权重及输入布局、前向输出和梯度一致性、tracing 跳过、重复安装和 `Qwen3Backbone` 方法。
 
 | 内容 | 入口 |
 |---|---|
@@ -1169,3 +1220,147 @@ samples/s = global_batch_size × 10 / max_rank(sum(step_seconds[20:30]))
 | batch 32：A、B 原始逐 rank 指标 | [A 归档](../../data/outputs/vision-layout-a-b32-100step-20261028-161855-2875875/attempt-A-b32/step_metrics/)、[B 归档](../../data/outputs/vision-layout-b-b32-100step-20261028-162246-2972435/attempt-A-b32/step_metrics/) |
 
 batch 32 的 B 组归档子目录沿用了 `attempt-A-b32` 名称；其 [运行命令和环境](../../data/outputs/vision-layout-b-b32-100step-20261028-162246-2972435/attempt-A-b32/command.json)记录的布局开关为 `1`。
+
+
+### 8.2 Apex FusedAdam 优化项
+
+**优化思路。** 使用 Apex FusedAdam 融合 Adam 更新中的逐元素操作，并通过 multi-tensor apply 批量处理参数更新。现有 Transformers 的 `adamw_apex_fused` 工厂负责创建优化器；`adam_w_mode=True` 保持 AdamW 的解耦权重衰减，参数分组、学习率、betas 和 eps 沿用原 Trainer 路径。实现见 [fused_adam.py](../gr00t/Replacement/fused_adam.py)。
+
+环境变量 `GR00T_APEX_FUSED_ADAM` 默认关闭，只接受 `0` 或 `1`，切换后须启动新进程。标准微调入口的原优化器为 `torch.optim.AdamW`：
+
+```bash
+GR00T_APEX_FUSED_ADAM=1 bash start.sh  # 启用
+GR00T_APEX_FUSED_ADAM=0 bash start.sh  # 回退原优化器
+```
+
+**实测结果。** 八卡、全局 batch 768、每卡 96、BF16、ZeRO-2、梯度累积 1；每轮独立训练 100 步，测速时关闭 Profiler。统计第 71–80 步，吞吐为 `768 × 10 / max_rank(sum(step_seconds[70:80]))`；两轮取中位数，窗口内逐步最慢 rank 耗时 CV 超过 5% 的轮次判为无效。
+
+| 配置 | 第 1 轮 samples/s | 第 2 轮 samples/s | 中位吞吐 samples/s | 相对 BASE |
+|---|---:|---:|---:|---:|
+| BASE | 580.937 | 579.316 | 580.127 | — |
+| Apex FusedAdam | 593.232 | 593.368 | 593.300 | +2.27% |
+
+四轮均有效。本次观察到 FusedAdam 吞吐提高。后续轮次可能复用框架默认编译缓存。逐轮耗时、CV、峰值显存和配置见[本次测速报告](../../data/benchmarks/optimizations/apex-fused-adam-speed-b768-20261029-050812/report.md)。
+
+同为全局 batch 768 时，按提供的 Trace 读数，优化器更新事件从基线的 `Optimizer.step#AdamW.step` **28 ms 374 µs 612 ns** 降至 `Optimizer.step#FusedAdam.step` **5 ms 811 µs 680 ns**，减少约 **79.52%**。Trace 为独立采集，见 [BASE 八 rank Trace](../../data/benchmarks/optimizations/apex-fused-adam-base-b768-20261029-113044/base/profiling/)和 [FusedAdam 八 rank Trace](../../data/benchmarks/optimizations/apex-fused-adam-b768-20261029-105333/fused-adam/profiling/)。
+
+### 8.3 数据读取优化
+
+#### 8.3.1 Trace 现象
+
+本节记录尚待优化的数据读取与搬运路径。两组分别设置 DataLoader 的 `pin_memory=False` 和 `pin_memory=True`。大块 H2D 指每个 step 中 144 MiB 的拷贝、有效带宽为拷贝字节数除以 GPU trace 中该次 `Memcpy HtoD` 的持续时间。H2D 前 GPU 空档指该次大块拷贝开始前，本 rank 所有 GPU stream 上最近一个 kernel、memcpy 或 memset 事件结束，到这次拷贝开始之间的时间。
+
+| 指标 | `pin_memory=False` | `pin_memory=True` |
+|---|---:|---:|
+| 144 MiB H2D 耗时| 17.01 ms| 19.13 ms |
+| 144 MiB H2D 有效带宽| 8.88 GB/s| 7.89 GB/s |
+| 大块 H2D 启动前 GPU 空档| 85.90 ms| 69.04 ms |
+| 大块 H2D 前嵌套 CPU `aten::copy_`| 85.25 ms| 68.52 ms |
+| 每 step 所有 H2D 事件耗时之和 | 17.38 ms | 19.55 ms |
+| 完整 step 耗时 | 1477.77 ms | 1393.69 ms |
+
+**读表说明：** 表中 H2D 耗时与带宽只统计 GPU 侧 `Memcpy HtoD`，不含其前 CPU 上的 dtype 转换。大块 H2D 前的 GPU 空档与嵌套 CPU `aten::copy_` 耗时相差不足 1 ms，，空档主要由这段 CPU 转换造成。
+
+原始数据：[pin_memory=False 八 rank Trace](../../data/benchmarks/optimizations/data-loading-b768/pin-memory-ab/pin_false/profiling/)、[pin_memory=True 八 rank Trace](../../data/benchmarks/optimizations/data-loading-b768/pin-memory-ab/pin_true/profiling/)、[采集脚本](../../data/benchmarks/optimizations/data-loading-b768/pin-memory-ab/run_ab.py)；
+
+#### 8.3.2 已排查的数据路径
+
+**结论：DataLoader 的 pin memory 已生效，但 dtype 转换生成了新的非 pinned 张量，单卡复现中的 H2D 没有直接使用原来的 pinned 张量。**
+
+在一次 DataLoader batch 的单卡诊断中，`pixel_values` 的形状为 `(49152, 1536)`、dtype 为 float32、大小为 288 MiB，并且 `is_pinned()=True`；batch 经过 CPU float32→BF16 转换后，单独检查的中间张量为 144 MiB，`is_pinned()=False`。
+
+```text
+DataLoader 输出的 pixel_values（pin_memory=True）
+  CPU float32，288 MiB，pinned=True
+        │
+        │  阻塞式 .to(device, dtype=bfloat16)    整个调用（外层 aten::to）：88.2 ms
+        │  ┌─ ① CPU 上 float32→BF16 转换（嵌套 aten::copy_，期间无 hip 调用）
+        │  │     68.52 ms，按输出 144 MiB 折算约 2.20 GB/s
+        ▼  │     GPU 在此期间空档：69.04 ms
+  新的 CPU bfloat16 张量，144 MiB，pinned=False
+        │
+        │  ② H2D（GPU 侧 Memcpy HtoD，源为非 pinned）
+        │     19.13 ms，7.89 GB/s
+        ▼
+  GPU bfloat16 张量
+
+端到端：144 MiB ÷ ①+② 的整个 .to() ≈ 1.71 GB/s
+```
+
+图中耗时均为 8.3.1 中 `pin_memory=True` 组 8 个 rank × 3 个 step、共 24 次观测的中位数，带宽按十进制 GB/s 折算；①、② 之间的 pinned 状态变化来自单卡诊断，不是八卡 Trace 直接观测到的。主要耗时在 CPU 转换，而不在 H2D 传输本身。
+
+#### 8.3.3 优化方向与实现
+
+优化方向：
+
+1. **H2D 直接读取 pinned 的内存**：让最终拷贝的源就是 DataLoader 固定的那块内存。
+2. **把 CPU dtype 转换移出主线程的关键路径**：不再在 `.to()` 里同步做 float32→BF16。
+
+```text
+当前路径：
+CPU float32（已 pinned）
+  → CPU 转 BF16，生成非 pinned 新张量   （主线程）
+  → H2D
+
+优化后路径：
+CPU float32
+  → DataLoader worker 中转 BF16          （移出主线程）
+  → DataLoader pin 线程固定 BF16 张量
+  → H2D                                  （直接读 pinned，只搬 144 MiB）
+```
+
+**具体做法：** 在 DataLoader worker 内把 `pixel_values` 提前转成 BF16，同时满足上述两条。`Bf16PixelValuesCollator` 包住原 collator，只把 `inputs["pixel_values"]` 从 float32 转成 BF16，其他张量不动；pin 线程固定的就是 BF16 张量，`Trainer._prepare_input` 里的 `.to(device, dtype=bf16)` 因 dtype 已一致不再转换，H2D 直接读 pinned 内存。推理共用的 `Gr00tN1d7DataCollator` 不改。
+
+环境变量 `GR00T_PIXEL_VALUES_BF16` 默认是 `0`，只接受 `0` 和 `1`，设为 `1` 则安装上述包装器。启动训练前启用或回退：
+
+```bash
+# 启用
+GR00T_PIXEL_VALUES_BF16=1 bash start.sh
+
+# 回退：使用原有 collator 和 .to() 转换
+GR00T_PIXEL_VALUES_BF16=0 bash start.sh
+```
+
+取消设置变量也会恢复原路径。开关在训练进程启动时读取，不支持训练中切换；关闭时不安装包装器，collator 保持原对象。启用后 rank 0 日志会打印一行 `GR00T_PIXEL_VALUES_BF16=1: pixel_values is cast to BF16 in DataLoader workers`。
+
+实现位于 `gr00t/Replacement/pixel_values_bf16.py`，由 `experiment.run()` 在 DeepSpeed 配置校验之后、创建 Trainer 之前安装。
+
+当前限制：
+
+- 必须启用 DeepSpeed 且为 BF16（`bf16=True`、`fp16=False`）。HF 只在 DeepSpeed 下才把浮点输入转 BF16，其他配置下提前转会改变数值路径，此时直接报错。
+- 只转 `pixel_values`；state、action 等小张量仍由 HF 转换。
+- batch 结构不符（无 `pixel_values`、非 CPU 张量、dtype 不是 float32/BF16）报错；已是 BF16 则原样放行。
+- `dataloader_num_workers=0` 时转换仍在主进程，无收益，仅打印提示。
+
+#### 8.3.4 优化结果
+
+BASE、8 卡、全局 batch 768、每卡 96、BF16、ZeRO-2。`GR00T_PIXEL_VALUES_BF16=0`（off）与 `=1`（on）各采集 1 次，取 8 个 rank × 3 个 step、共 24 次观测的中位数。off 为本次对照基线，与 8.3.1 是不同次采集。
+
+| 指标 | off | on |
+|---|---:|---:|
+| 整个 `.to()` | 84.57 ms | 4.43 ms |
+| 其中 H2D 前 CPU `aten::copy_`（dtype 转换） | 65.39 ms | 0 ms |
+| 144 MiB H2D 耗时 | 18.25 ms | 4.36 ms |
+| 144 MiB H2D 有效带宽 | 8.27 GB/s | 34.60 GB/s |
+| 大块 H2D 启动前 GPU 空档 | 65.93 ms | 0.05 ms |
+| 完整 step 耗时 | 1367.32 ms | 1248.14 ms |
+
+原始数据：[off 八 rank Trace](../../data/benchmarks/optimizations/data-loading-b768/pixel-values-bf16-ab/bf16_off/profiling/)、[on 八 rank Trace](../../data/benchmarks/optimizations/data-loading-b768/pixel-values-bf16-ab/bf16_on/profiling/)、[采集脚本](../../data/benchmarks/optimizations/data-loading-b768/pixel-values-bf16-ab/run_ab.py)、[汇总](../../data/benchmarks/optimizations/data-loading-b768/pixel-values-bf16-ab/summary.json)。
+
+**结论：**
+
+- 两个方向均达成：H2D 前的 CPU 转换消失， `.to()` 由 84.57 ms 降到 4.43 ms，每步开头的 GPU 空档由 65.93 ms 降到 0.05 ms
+- H2D 带宽由 8.27 GB/s 升到 34.60 GB/s，与 pinned 内存的传输速率相符
+- 完整 step 缩短 119 ms，大于 `.to()` 节省的约 80 ms
+- step 10、20 的日志 loss 显示值一致（1.2578、1.1786）
+
+#### 8.3.5 独立训练吞吐与数据加载等待
+
+**测速口径：** BASE、8 卡、全局 batch 768、BF16、ZeRO-2、4 worker/rank；关闭 profiler，每组两轮、每轮 100 步。统计第 71–80 步，吞吐为 `768 × 10 / max_rank(sum(step_seconds[70:80]))`，四轮均通过稳态验收。本次测速与 8.3.4 的 Trace 独立采集。
+
+| 方案 | 第 1 轮 | 第 2 轮 | 中位吞吐 | 相对 off | 说明 |
+|---|---:|---:|---:|---:|---|
+| off（原路径） | 579.674 | 581.520 | 580.597 | — | 两轮有效 |
+| on（提前转 BF16） | 629.138 | 628.297 | **628.718** | **+8.29%** | 两轮有效 |
+
+**数据加载等待：** off、on 各独立运行 30 步，统计第 21–30 步主线程 `next(epoch_iterator)` 的墙钟等待。8 个 rank 的各自中位数范围分别为 off **0.134–0.189 ms**、on **0.138–0.151 ms**；最大单次等待分别为 **0.265 ms** 和 **0.240 ms**。[独立测速归档](../../data/benchmarks/optimizations/data-loading-b768/pixel-values-bf16-speed/)包含逐轮数据、诊断结果、源码快照和资源监控；[测速报告](../../data/benchmarks/optimizations/data-loading-b768/pixel-values-bf16-speed/report.md)列出逐 rank 等待统计。

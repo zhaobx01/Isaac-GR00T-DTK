@@ -61,10 +61,9 @@ def test_old_allgather_and_diagnostic_fields_are_removed():
                        or key in {"deepspeed_config_path", "diagnose_zero_comm"} for key in fields)
 
 
-def test_existing_visual_compilation_and_runtime_tools_remain():
+def test_runtime_tools_and_cache_policy_remain():
     root = Path(__file__).resolve().parents[3]
     backbone = (root / "gr00t/model/modules/qwen3_backbone.py").read_text()
-    assert '_compile_qwen3_vision_block_classes(self.model.visual)' in backbone
     assert 'use_cache=False' not in backbone
     source = (root / "gr00t/experiment/experiment.py").read_text()
     assert 'NumericalMonitor' in source and 'StepMetricsCallback' in source

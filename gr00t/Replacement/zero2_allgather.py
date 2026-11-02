@@ -37,6 +37,21 @@ def validate_vendor_build(deepspeed_version: str, torch_version: str, method_has
     return True
 
 
+def _is_fused_adam_type(optimizer_type: type) -> bool:
+    try:
+        from apex.optimizers import FusedAdam
+    except (ImportError, OSError):
+        return False
+    return optimizer_type is FusedAdam
+
+
+def _validate_fused_adam_options(optimizer: Any) -> None:
+    if (getattr(optimizer, "adam_w_mode", None) != 1
+            or getattr(optimizer, "capturable", None) is not False
+            or getattr(optimizer, "master_weights", None) is not False):
+        raise ValueError("FusedAdam requires AdamW mode without capturable or master weights")
+
+
 def validate_zero2_optimizer_attributes(
     *,
     stage: int,
@@ -63,8 +78,8 @@ def validate_zero2_optimizer_attributes(
         unsupported.append("ZeRO-2 gradient partitioning and reduce-scatter must be enabled")
     if gradient_accumulation_steps != 1:
         unsupported.append("gradient accumulation steps must be 1")
-    if optimizer_type is not torch.optim.AdamW:
-        unsupported.append("optimizer must be torch.optim.AdamW")
+    if optimizer_type is not torch.optim.AdamW and not _is_fused_adam_type(optimizer_type):
+        unsupported.append("optimizer must be torch.optim.AdamW or Apex FusedAdam")
     if optimizer_group_count != zero_group_count:
         unsupported.append("optimizer and ZeRO parameter group counts differ")
     if not has_all_gather_into_tensor:
@@ -72,6 +87,28 @@ def validate_zero2_optimizer_attributes(
     if unsupported:
         raise RuntimeError("Unsupported ZeRO-2 AllGather pipeline runtime: " + "; ".join(unsupported))
     return True
+
+
+def _optimizer_step_for_group(zero_optimizer: Any, index: int) -> None:
+    """Align Apex's parallel master list with DeepSpeed's temporary group selection."""
+    import torch
+
+    optimizer = zero_optimizer.optimizer
+    if type(optimizer) is torch.optim.AdamW:
+        zero_optimizer._optimizer_step(index)
+        return
+    if not _is_fused_adam_type(type(optimizer)):
+        raise RuntimeError(f"Unsupported AllGather optimizer: {type(optimizer)}")
+    _validate_fused_adam_options(optimizer)
+    original_groups = optimizer.param_groups
+    original_masters = optimizer.param_groups_master
+    group = original_groups[index]
+    optimizer.param_groups_master = [{"params": [None] * len(group["params"])}]
+    try:
+        zero_optimizer._optimizer_step(index)
+    finally:
+        optimizer.param_groups = original_groups
+        optimizer.param_groups_master = original_masters
 
 
 def _pipeline_zero2_step(self, closure=None):
@@ -141,7 +178,7 @@ def _pipeline_zero2_step(self, closure=None):
 
                 self.timers(OPTIMIZER_STEP_TIMER).start()
                 with torch.profiler.record_function(f"zero2_allgather::adamw_update_{index}"):
-                    self._optimizer_step(index)
+                    _optimizer_step_for_group(self, index)
                 self.single_partition_of_fp32_groups[index].grad = None
                 del single_grad_partition
 
@@ -220,6 +257,7 @@ def describe_partition_layout(
 
 
 def _validate_engine(engine: Any, mode: str, group_plan: list[dict]) -> dict:
+    import torch
     from deepspeed import comm
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 
@@ -247,6 +285,8 @@ def _validate_engine(engine: Any, mode: str, group_plan: list[dict]) -> dict:
         "has_all_gather_into_tensor": comm.has_all_gather_into_tensor(),
     }
     validate_zero2_optimizer_attributes(**attributes)
+    if type(inner_optimizer) is not torch.optim.AdamW:
+        _validate_fused_adam_options(inner_optimizer)
     if not isinstance(zero_optimizer, DeepSpeedZeroOptimizer):
         raise RuntimeError(f"Unsupported ZeRO optimizer type: {type(zero_optimizer)}")
     if zero_optimizer.torch_autocast_gradscaler or zero_optimizer.zenflow:
@@ -291,6 +331,7 @@ def _validate_engine(engine: Any, mode: str, group_plan: list[dict]) -> dict:
         "group_elements": actual_elements,
         "group_plan": group_plan,
         "optimizer_options": optimizer_options,
+        "optimizer_class": f"{type(inner_optimizer).__module__}.{type(inner_optimizer).__qualname__}",
         "partition_layout": partition_layout,
         "vendor": version_record,
         "effective_config": config,
@@ -318,6 +359,7 @@ def validate_all_ranks(engine: Any, mode: str, group_plan: list[dict]) -> list[d
             record["record"]["mode"],
             record["record"]["stage"],
             record["record"]["dtype"],
+            record["record"]["optimizer_class"],
             record["record"]["gradient_accumulation_steps"],
             record["record"]["group_elements"],
             tuple(
@@ -474,11 +516,14 @@ def regroup_optimizer_parameter_groups(parameter_groups: list[dict], target_elem
 
 
 def regroup_torch_optimizer(optimizer: Any, target_elements: int, parameter_names: dict[int, str]) -> list[dict]:
-    """Regroup an unstepped Torch AdamW while preserving source-group options."""
+    """Regroup an unstepped supported AdamW while preserving source-group options."""
     import torch
 
-    if type(optimizer) is not torch.optim.AdamW:
-        raise ValueError(f"Expected torch.optim.AdamW before DeepSpeed initialization, got {type(optimizer)}")
+    fused = type(optimizer) is not torch.optim.AdamW
+    if fused:
+        if not _is_fused_adam_type(type(optimizer)):
+            raise ValueError(f"Expected torch.optim.AdamW or Apex FusedAdam, got {type(optimizer)}")
+        _validate_fused_adam_options(optimizer)
     if optimizer.state:
         raise ValueError("Optimizer groups can only be changed before the first optimizer step")
 
@@ -515,6 +560,10 @@ def regroup_torch_optimizer(optimizer: Any, target_elements: int, parameter_name
         sub_index += 1
 
     optimizer.param_groups = regrouped
+    if fused:
+        optimizer.param_groups_master = [
+            {"params": [None] * len(group["params"])} for group in regrouped
+        ]
     return manifest
 
 
@@ -625,8 +674,8 @@ def validate_training_config(config) -> None:
     t = config.training
     if t.deepspeed_stage != 2 or t.use_ddp or t.num_gpus != 8:
         raise ValueError("AllGather pipeline requires 8-GPU DeepSpeed ZeRO-2")
-    if not t.bf16 or t.fp16 or t.optim != "adamw_torch":
-        raise ValueError("AllGather pipeline requires BF16 and adamw_torch")
+    if not t.bf16 or t.fp16 or t.optim not in ("adamw_torch", "adamw_apex_fused"):
+        raise ValueError("AllGather pipeline requires BF16 and adamw_torch or adamw_apex_fused")
     if t.gradient_accumulation_steps != 1:
         raise ValueError("AllGather pipeline requires gradient accumulation steps=1")
     if t.resume_from_checkpoint:

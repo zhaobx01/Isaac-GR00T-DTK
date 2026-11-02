@@ -3,10 +3,9 @@ import os
 
 
 def resolve_compile_variant(environ=None):
-    value = (os.environ if environ is None else environ).get("GR00T_COMPILE_VARIANT", "off")
-    if value not in {"off", "vl", "dit-model", "dit-model-vl"}:
-        raise ValueError("GR00T_COMPILE_VARIANT must be off, vl, dit-model or dit-model-vl")
-    return value
+    from gr00t.Replacement.model_compile import resolve_variant
+
+    return resolve_variant(environ)
 
 
 def resolve_legacy_compile_request(training, compile_variant):

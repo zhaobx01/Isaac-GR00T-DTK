@@ -204,6 +204,9 @@ def run(config: Config):
         resolve_zero2_pack_timing,
     )
 
+    from gr00t.Replacement.fused_adam import resolve_optimizer, validate_deepspeed_config
+
+    config.training.optim = resolve_optimizer(config.training.optim)
     trainer_class = resolve_trainer_class(config)
     compile_variant = resolve_compile_variant()
     legacy_compile_request = resolve_legacy_compile_request(config.training, compile_variant)
@@ -278,6 +281,12 @@ def run(config: Config):
     pipeline = MODEL_REGISTRY.get(type(config.model))(config, save_cfg_dir)
     pipeline.setup()
     model = pipeline.return_model()
+    from gr00t.Replacement.model_compile import write_baseline_manifest
+
+    baseline_compile_info = getattr(model.backbone, "_gr00t_baseline_compile", {
+        "status": "not_applicable", "installation_only": True,
+    })
+    write_baseline_manifest(output_dir, baseline_compile_info)
     compile_info = {"variant": compile_variant, "paths": []}
     if legacy_compile_request is not None:
         from gr00t.experiment.compilation import install_model_compile
@@ -311,6 +320,17 @@ def run(config: Config):
         deepspeed_config = load_experiment_deepspeed(config.get_deepspeed_config())
     else:
         deepspeed_config = None
+
+    validate_deepspeed_config(config.training.optim, deepspeed_config)
+
+    from gr00t.Replacement import pixel_values_bf16
+
+    wrapped_collator = pixel_values_bf16.install(data_collator, config, deepspeed_config)
+    if wrapped_collator is not data_collator and global_rank == 0:
+        logging.info(
+            f"{pixel_values_bf16.ENV_VAR}=1: pixel_values is cast to BF16 in DataLoader workers"
+        )
+    data_collator = wrapped_collator
 
     # for now we will let per_gpu_batch_size override global_batch_size, in future we will deprecate per_gpu_batch_size
     if config.training.per_gpu_batch_size is None:
@@ -369,6 +389,17 @@ def run(config: Config):
         multiprocessing_context=config.data.multiprocessing_context,
         numerics_monitor=numerics_monitor,
     )
+    optimizer_evidence = os.environ.get("GR00T_RECORD_BASELINE_OPTIMIZER", "0")
+    if optimizer_evidence not in {"0", "1"}:
+        raise ValueError("GR00T_RECORD_BASELINE_OPTIMIZER must be 0 or 1")
+    if optimizer_evidence == "1" and config.training.optim == "adamw_torch":
+        from gr00t.experiment.profiling import baseline_optimizer_evidence_callback
+
+        trainer.add_callback(baseline_optimizer_evidence_callback(trainer))
+    if config.training.optim == "adamw_apex_fused":
+        from gr00t.Replacement.fused_adam import optimizer_evidence_callback
+
+        trainer.add_callback(optimizer_evidence_callback(trainer))
     if compile_variant != "off":
         from gr00t.Replacement.model_compile import evidence_callback
 
@@ -404,6 +435,7 @@ def run(config: Config):
                     "compile_variant": compile_info["variant"],
                     "compiled_paths": compile_info["paths"],
                     "legacy_compile_request": legacy_compile_request,
+                    "baseline_compile": baseline_compile_info,
                     "global_batch_size": config.training.global_batch_size,
                     "num_gpus": config.training.num_gpus,
                 },
@@ -465,7 +497,14 @@ def run(config: Config):
         if config.training.enable_profiling:
             from functools import partial
 
-            from gr00t.experiment.profiling import make_profiler_schedule
+            from gr00t.experiment.profiling import StopAfterTrace, make_profiler_schedule
+
+            stop_after_trace = os.environ.get("GR00T_PROFILER_STOP_AFTER_TRACE", "0")
+            if stop_after_trace not in {"0", "1"}:
+                raise ValueError("GR00T_PROFILER_STOP_AFTER_TRACE must be 0 or 1")
+            if stop_after_trace == "1" and config.training.profiler_repeat != 1:
+                raise ValueError("Stopping after trace requires profiler_repeat=1")
+            controller = None
 
             logging.info(f"{global_rank} Starting training with profiling...")
 
@@ -478,12 +517,14 @@ def run(config: Config):
                     profile_dir / f"trace_rank_{global_rank}_iter_{trainer.state.global_step}.json"
                 )
                 prof.export_chrome_trace(str(output_path))
+                if controller is not None:
+                    controller.mark_trace_exported()
                 logging.info(f"Trace saved to {output_path}")
 
             profile_dir = output_dir / "profiling"
             run_on_rank0(profile_dir.mkdir, parents=True, exist_ok=True, label="profile_dir.mkdir")
 
-            with torch.profiler.profile(
+            raw_profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
@@ -493,7 +534,15 @@ def run(config: Config):
                 with_stack=config.training.profiler_with_stack,
                 # record_shapes=True,
                 on_trace_ready=partial(on_trace_ready_handler, trainer, profile_dir),
-            ) as prof:
+            )
+            if stop_after_trace == "1":
+                def record_profiler_stop():
+                    path = profile_dir / f"profiler-stopped-rank-{global_rank}.json"
+                    path.write_text(json.dumps({"rank": global_rank, "step": trainer.state.global_step,
+                                                "stopped_after_trace": True}) + "\n")
+
+                controller = StopAfterTrace(raw_profiler, on_stopped=record_profiler_stop)
+            with (controller if controller is not None else raw_profiler) as prof:
                 trainer.add_callback(ProfCallback(prof=prof))
                 trainer.train(resume_from_checkpoint=config.training.resume_from_checkpoint)
         else:

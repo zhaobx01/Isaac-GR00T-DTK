@@ -28,11 +28,24 @@ def resolve_policy(environ=None):
     return policy, path, diagnostic == "1"
 
 
+ADAPTER_VARIANTS = ("vl", "dit-model", "dit-model-vl")
+
+
 def validate_activation(policy, diagnostic, variant, legacy):
-    if (policy != "auto" or diagnostic) and legacy is not None:
+    """Fixed padding acts on trainer inputs and works with any compile selection.
+
+    Dynamic buckets and diagnostics wrap compiled VL/DiT callables, so they need one of
+    ``ADAPTER_VARIANTS``; their argument mapping does not fit DiT blocks or text layers.
+    """
+    if policy != "dynamic-buckets" and not diagnostic:
+        return
+    if legacy is not None:
         raise ValueError("Sequence diagnostics and dynamic buckets do not support legacy CLI compilation")
-    if (policy != "auto" or diagnostic) and variant != "dit-model-vl":
-        raise ValueError("Sequence diagnostics and dynamic buckets require dit-model-vl")
+    if variant not in ADAPTER_VARIANTS:
+        raise ValueError(
+            "Sequence diagnostics and dynamic buckets require one of "
+            f"{', '.join(ADAPTER_VARIANTS)}"
+        )
 
 
 class DiagnosticRecorder:

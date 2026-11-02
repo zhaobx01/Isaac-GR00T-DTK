@@ -50,6 +50,7 @@ def test_allgather_rank_agreement_includes_parameter_plan_and_optimizer_options(
         "partition_layout": [{"parameter_elements": 4, "flat_elements": 8,
                               "padding_elements": 4, "partition_elements": [1] * 8}],
         "group_plan": [{"source_group_index": 0, "parameter_names": ["a", "b"]}],
+        "optimizer_class": "torch.optim.AdamW",
         "optimizer_options": [{"lr": 1e-4, "weight_decay": 0.01}],
         "effective_config": plugin.deepspeed_config,
     }
@@ -68,6 +69,7 @@ def test_allgather_rank_agreement_includes_parameter_plan_and_optimizer_options(
         ("group_plan", [{"source_group_index": 0, "parameter_names": ["b", "a"]}]),
         ("group_plan", [{"source_group_index": 1, "parameter_names": ["a", "b"]}]),
         ("optimizer_options", [{"lr": 2e-4, "weight_decay": 0.01}]),
+        ("optimizer_class", "apex.optimizers.FusedAdam"),
         ("effective_config", {"zero_optimization": {"stage": 2, "overlap_comm": False}}),
     ):
         remote = {**deepcopy(record), field: value}
@@ -377,6 +379,168 @@ def test_torch_optimizer_regroup_rejects_existing_state():
         assert "before the first optimizer step" in str(exc)
     else:
         raise AssertionError("optimizer groups cannot change after state creation")
+
+
+def test_fused_optimizer_group_step_matches_full_step_and_restores_lists(monkeypatch):
+    """Exercise real Apex Python step with its GPU kernel replaced by CPU math."""
+    import torch
+    import apex.optimizers.fused_adam as apex_module
+    from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+    from gr00t.Replacement.zero2_allgather import _optimizer_step_for_group
+
+    def cpu_apply(_kernel, _overflow, tensors, lr, beta1, beta2, eps, step,
+                  adam_w_mode, bias_correction, weight_decay):
+        assert adam_w_mode == bias_correction == 1
+        with torch.no_grad():
+            for grad, param, mean, variance in zip(*tensors):
+                mean.mul_(beta1).add_(grad, alpha=1 - beta1)
+                variance.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                denom = variance.sqrt().div_((1 - beta2 ** step) ** .5).add_(eps)
+                param.mul_(1 - lr * weight_decay)
+                param.addcdiv_(mean, denom, value=-lr / (1 - beta1 ** step))
+
+    monkeypatch.setattr(apex_module, "multi_tensor_applier", cpu_apply)
+
+    def make_optimizer():
+        parameters = [torch.nn.Parameter(torch.tensor([1.0, 2.0])),
+                      torch.nn.Parameter(torch.tensor([3.0, 4.0, 5.0])),
+                      torch.nn.Parameter(torch.tensor([6.0]))]
+        optimizer = apex_module.FusedAdam.__new__(apex_module.FusedAdam)
+        torch.optim.Optimizer.__init__(optimizer, [{"params": [p]} for p in parameters],
+            {"lr": .01, "betas": (.9, .99), "eps": 1e-8,
+             "weight_decay": .01, "bias_correction": True})
+        optimizer.param_groups_master = [{"params": [None]} for _ in parameters]
+        optimizer.adam_w_mode, optimizer.capturable, optimizer.master_weights = 1, False, False
+        optimizer._dummy_overflow_buf = torch.zeros(1, dtype=torch.int)
+        optimizer.multi_tensor_adam = object()
+        return optimizer, parameters
+
+    reference, expected = make_optimizer()
+    actual, observed = make_optimizer()
+    # Mimic regrouping having invalidated Apex's parallel group list.
+    actual.param_groups_master = [{"params": []}]
+    stale_master = actual.param_groups_master
+    original_groups = actual.param_groups
+
+    class ZeroOptimizer:
+        optimizer = actual
+        torch_autocast_gradscaler = False
+        zenflow = False
+
+        def _lazy_init_hp_params_optimizer_state(self):
+            pass
+
+        def _optimizer_step(self, index):
+            return DeepSpeedZeroOptimizer._optimizer_step(self, index)
+
+    for step in range(3):
+        for index, (left, right) in enumerate(zip(expected, observed)):
+            left.grad = torch.full_like(left, (step + 1) * (index + 1) / 10)
+            right.grad = left.grad.clone()
+        reference.step()
+        for index in range(len(observed)):
+            _optimizer_step_for_group(ZeroOptimizer(), index)
+        for left, right in zip(expected, observed):
+            torch.testing.assert_close(left, right)
+            torch.testing.assert_close(reference.state[left]["exp_avg"], actual.state[right]["exp_avg"])
+            torch.testing.assert_close(reference.state[left]["exp_avg_sq"], actual.state[right]["exp_avg_sq"])
+        assert actual.param_groups is original_groups
+        assert actual.param_groups_master is stale_master
+    assert [g['step'] for g in actual.param_groups] == [3, 3, 3]
+
+
+def test_fused_group_adapter_restores_lists_if_step_raises(monkeypatch):
+    import pytest
+    import torch
+    import apex.optimizers.fused_adam as apex_module
+    from gr00t.Replacement.zero2_allgather import _optimizer_step_for_group
+
+    param = torch.nn.Parameter(torch.ones(1))
+    optimizer = apex_module.FusedAdam.__new__(apex_module.FusedAdam)
+    torch.optim.Optimizer.__init__(optimizer, [param], {})
+    optimizer.adam_w_mode, optimizer.capturable, optimizer.master_weights = 1, False, False
+    optimizer.param_groups_master = [{"params": [None]}]
+    groups, masters = optimizer.param_groups, optimizer.param_groups_master
+
+    class ZeroOptimizer:
+        def __init__(self): self.optimizer = optimizer
+        def _optimizer_step(self, index):
+            self.optimizer.param_groups = [groups[index]]
+            raise RuntimeError("update failed")
+
+    with pytest.raises(RuntimeError, match="update failed"):
+        _optimizer_step_for_group(ZeroOptimizer(), 0)
+    assert optimizer.param_groups is groups
+    assert optimizer.param_groups_master is masters
+
+
+def test_regroup_accepts_fused_adam_in_adamw_mode_and_rejects_unsafe_modes():
+    import pytest
+    import torch
+    import apex.optimizers.fused_adam as apex_module
+
+    parameters = [torch.nn.Parameter(torch.ones(2)) for _ in range(3)]
+    optimizer = apex_module.FusedAdam.__new__(apex_module.FusedAdam)
+    torch.optim.Optimizer.__init__(optimizer, [{"params": parameters}], {})
+    optimizer.adam_w_mode, optimizer.capturable, optimizer.master_weights = 1, False, False
+    optimizer.param_groups_master = [{"params": [None] * len(parameters)}]
+    names = {id(p): f"p{i}" for i, p in enumerate(parameters)}
+    manifest = regroup_torch_optimizer(optimizer, 2, names)
+    assert [entry["parameter_names"] for entry in manifest] == [["p0"], ["p1"], ["p2"]]
+    assert optimizer.param_groups_master == [{"params": [None]}] * 3
+    optimizer.master_weights = True
+    with pytest.raises(ValueError, match="master|capturable"):
+        regroup_torch_optimizer(optimizer, 2, names)
+
+
+def test_allgather_guards_accept_fused_adam_and_reject_other_optimizers():
+    import pytest
+    import torch
+    import apex.optimizers.fused_adam as apex_module
+    from gr00t.configs.base_config import Config
+    from gr00t.Replacement.zero2_allgather import validate_training_config
+
+    config = Config()
+    config.training.deepspeed_stage = 2
+    config.training.use_ddp = False
+    config.training.num_gpus = 8
+    config.training.bf16, config.training.fp16 = True, False
+    config.training.optim = "adamw_apex_fused"
+    config.training.gradient_accumulation_steps = 1
+    config.training.resume_from_checkpoint = False
+    config.training.save_strategy = "no"
+    validate_training_config(config)
+    attributes = dict(stage=2, dtype=torch.bfloat16, cpu_offload=False,
+                      partition_gradients=True, reduce_scatter=True,
+                      gradient_accumulation_steps=1, optimizer_type=apex_module.FusedAdam,
+                      optimizer_group_count=3, zero_group_count=3,
+                      has_all_gather_into_tensor=True)
+    assert validate_zero2_optimizer_attributes(**attributes)
+    config.training.optim = "sgd"
+    with pytest.raises(ValueError, match="adamw"):
+        validate_training_config(config)
+    with pytest.raises(RuntimeError, match="optimizer"):
+        validate_zero2_optimizer_attributes(**{**attributes, 'optimizer_type': torch.optim.SGD})
+
+
+def test_plain_adamw_group_step_does_not_import_apex(monkeypatch):
+    import builtins
+    import torch
+    from gr00t.Replacement.zero2_allgather import _optimizer_step_for_group
+
+    optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+    events = []
+    class ZeroOptimizer:
+        def __init__(self): self.optimizer = optimizer
+        def _optimizer_step(self, index): events.append(index)
+    original_import = builtins.__import__
+    def import_without_apex(name, *args, **kwargs):
+        if name.startswith('apex'):
+            raise AssertionError('ordinary AdamW must not import Apex')
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', import_without_apex)
+    _optimizer_step_for_group(ZeroOptimizer(), 0)
+    assert events == [0]
 
 
 def test_pipeline_adapter_rejects_unpinned_vendor_build_and_source():

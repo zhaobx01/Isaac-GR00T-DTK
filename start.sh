@@ -28,7 +28,7 @@ label=${machine}_gbs${GLOBAL_BATCH_SIZE}_w8_h264_s100_${comm_tag}_${date_tag}_${
 # Profiling: PROFILE=1 adds the profiler flags; extra launch_finetune args can be appended after start.sh.
 launch_args=(--log-step-metrics --save-strategy no --no-save-final-model)
 if [ "${PROFILE:-0}" = "1" ]; then
-    launch_args+=(--enable-profiling --no-profiler-with-stack
+    launch_args+=(--enable-profiling
         --profiler-skip-first "${PROFILER_SKIP_FIRST:-20}" --profiler-wait "${PROFILER_WAIT:-1}"
         --profiler-warmup "${PROFILER_WARMUP:-5}" --profiler-active "${PROFILER_ACTIVE:-3}"
         --profiler-repeat 1)
