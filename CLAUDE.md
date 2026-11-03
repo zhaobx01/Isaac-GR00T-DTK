@@ -1,4 +1,8 @@
-# CLAUDE.md — Isaac GR00T N1.7
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+# Isaac GR00T N1.7
 
 ## Project overview
 
@@ -54,6 +58,18 @@ scripts/            # Deployment, conversion, and utility scripts
 tests/              # pytest suite (markers: gpu, not gpu)
 getting_started/    # User-facing guides and notebooks
 ```
+
+## Architecture
+
+**Model (`gr00t/model/`):** `Gr00tN1d7` (`gr00t/model/gr00t_n1d7/gr00t_n1d7.py:500`) composes `backbone` (`Qwen3Backbone`, selected via `get_backbone_cls` based on `config.model_name`), `action_head` (`Gr00tN1d7ActionHead`), and `collator`. Forward pass: `prepare_input` splits the batch into backbone/action inputs → `backbone()` produces features → `action_head()` runs flow-matching diffusion through a `DiT`/`AlternateVLDiT` (`gr00t/model/modules/dit.py`) and returns an MSE loss. Inference goes through `get_action` → `get_action_with_features`, which does iterative Euler integration over diffusion timesteps and supports real-time-chunking (RTC) for action inpainting across chunks. `EmbodimentTag` (`gr00t/data/embodiment_tags.py:29`) is the string-level robot identity (e.g. `"libero_sim"`); it's mapped to an integer projector slot via `EMBODIMENT_TAG_TO_PROJECTOR_INDEX` (`gr00t/model/gr00t_n1d7/processing_gr00t_n1d7.py:118`), which indexes the per-embodiment `CategorySpecificMLP` state/action encoders. `MODEL_REGISTRY` (`gr00t/model/registry.py`) dispatches a model config type to its `BasicPipeline` (`gr00t/model/base/model_pipeline.py`).
+
+**Data (`gr00t/data/`):** `DatasetFactory.build` (`gr00t/data/dataset/factory.py:36`) builds a `ShardedSingleStepDataset` per dataset spec — it reads LeRobot-format episodes via `LeRobotEpisodeLoader` and shards them by `embodiment_tag` plus that tag's `ModalityConfig`. Multiple per-embodiment datasets combine into a `ShardedMixtureDataset`, weighted by `mix_ratio`/`ds_weights_alpha`, which applies the model's processor while iterating. `modality_configs` is `dict[embodiment_tag, dict[modality_name, ModalityConfig]]`, resolved from the pre-registered `MODALITY_CONFIGS` table (`gr00t/configs/data/embodiment_configs.py`) or a user-supplied config file. `BasicDataCollator` batches samples into tensors; `gr00t/data/stats.py` precomputes per-embodiment normalization statistics.
+
+**Policy (`gr00t/policy/`):** `Gr00tPolicy` (`gr00t/policy/gr00t_policy.py:70`) loads the model and processor via `AutoModel`/`AutoProcessor`, selects the modality config for its embodiment tag, and in `_get_action` turns raw observations into `VLAStepData` → processor output → collated tensors → `model.get_action()` → unnormalized actions. `Gr00tSimPolicyWrapper` adapts flat sim-env observation keys into the nested dict `Gr00tPolicy` expects. The server/client split (`gr00t/policy/server_client.py`) uses ZeroMQ REQ/REP: `PolicyServer` wraps any `BasePolicy` and exposes `get_action`/`reset`/`get_modality_config` over `MsgSerializer` (msgpack+numpy, with an explicit `allow_pickle=False` boundary); `PolicyClient` proxies the same calls over the socket. `gr00t/eval/run_gr00t_server.py:main` is the CLI that picks a `Gr00tPolicy` (given `--model-path`) or `ReplayPolicy` (given `--dataset-path`) and starts the server.
+
+**Training pipeline (`gr00t/experiment/`):** `launch_finetune.py` is the CLI entry — it parses `FinetuneConfig` (tyro), builds a full `Config` via `get_default_config().load_dict(...)`, copies `FinetuneConfig` fields onto `config.model`/`config.training`/`config.data`, then calls `experiment.run(config)`. `experiment.py:run` drives the actual training loop: sets up the distributed process group, resolves the `MODEL_REGISTRY` pipeline, optionally calls `install_model_compile` (`compilation.py`) to wrap submodules in `torch.compile`, builds `TrainingArguments` and the custom `Gr00tTrainer` (`trainer.py:222`), attaches callbacks (checkpointing, best-metric tracking, an optional profiler via `profiling.py`), then calls `trainer.train()`. `Gr00tTrainer` overrides `get_train_dataloader` (reseeds the mixture dataset correctly on resume) and `compute_loss` (adds token-accuracy and numerics-monitor logging). `compilation.py` installs lazy `torch.compile` wrappers onto specific submodules (DiT blocks, the whole DiT, Qwen3VL text decoder layers, VL self-attention blocks) with strict preflight checks and idempotency guards so repeated calls with the same config are no-ops. `profiling.py` builds a `torch.profiler.schedule` from the training config's `profiler_*` fields.
+
+**Configs (`gr00t/configs/`):** `FinetuneConfig` is the flat, tyro-parsed CLI front door; `launch_finetune.py` fans its fields into the nested `Config` (model/data/training sub-configs). `TrainingConfig` (`gr00t/configs/training/training_config.py`) is the nested sub-config actually consumed by `experiment.run` to build `TrainingArguments`/DeepSpeed config/trainer callbacks. Some fields (e.g. `compile_dit_blocks`, `global_batch_size`) exist in both — `FinetuneConfig` values overwrite `TrainingConfig` defaults in `launch_finetune.py`.
 
 ## Key entry points
 

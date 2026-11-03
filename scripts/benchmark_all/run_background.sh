@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# 后台依次运行两组完整测速：当前默认序列策略，再加 auto 对照。
+# 后台运行一组完整测速（当前默认序列策略）。
 # 断开终端 / ssh 后继续运行；用法：bash run_background.sh [benchmark.py 额外参数...]
-# 额外参数（如 --cases ... --rounds N）会同时传给两组运行；不要在其中指定 --output 或 --sequence-policy。
+# 额外参数（如 --cases ... --rounds N）会传给本次运行；不要在其中指定 --output 或 --sequence-policy。
 set -u
 
 script="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
@@ -12,7 +12,7 @@ lock="$out_root/.all-optimizations.lock"
 # ---------------------------------------------------------------- worker ----
 if [ "${1:-}" = "--worker" ]; then
   shift
-  output="$1"; auto_output="$2"; pidfile="$3"; shift 3
+  output="$1"; pidfile="$2"; shift 2
   child=
 
   cleanup() { rm -f "$lock"; }
@@ -45,13 +45,10 @@ if [ "${1:-}" = "--worker" ]; then
   }
 
   run_one "当前配置" "$output" "$@"
-  first_status=$?
-  run_one "auto 配置" "$auto_output" --sequence-policy auto "$@"
-  auto_status=$?
+  status=$?
 
-  echo "$first_status $auto_status" > "${output}.exit"
-  [ "$first_status" -eq 0 ] && [ "$auto_status" -eq 0 ]
-  exit $?
+  echo "$status" > "${output}.exit"
+  exit $status
 fi
 
 # -------------------------------------------------------------- launcher ----
@@ -65,14 +62,13 @@ if [ -f "$lock" ] && kill -0 "$(cat "$lock" 2>/dev/null)" 2>/dev/null; then
 fi
 
 output="$out_root/all-optimizations-$(date +%Y%m%d-%H%M%S)"
-auto_output="${output}-auto"
 pidfile="${output}.pid"
 log="${output}.log"
 
 # setsid 让进程脱离当前会话，ssh 断开或会话被清理时不会随之被杀；nohup 额外忽略 SIGHUP。
 detach=(nohup)
 if command -v setsid >/dev/null; then detach=(setsid nohup); fi
-"${detach[@]}" bash "$script" --worker "$output" "$auto_output" "$pidfile" "$@" \
+"${detach[@]}" bash "$script" --worker "$output" "$pidfile" "$@" \
   > "$log" 2>&1 < /dev/null &
 
 # 等待 worker 写出自己的 PID，确认真正启动。
@@ -87,8 +83,7 @@ fi
 
 pid="$(cat "$pidfile")"
 echo "进程 PID：$pid"
-echo "当前配置结果：$output"
-echo "auto 配置结果：$auto_output"
+echo "结果输出：$output"
 echo "运行日志：$log"
 echo "退出码文件：${output}.exit（运行结束后生成）"
 echo "查看进度：tail -f $log"

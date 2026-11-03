@@ -234,7 +234,7 @@ def resolve_mode(environ=None):
     """Validate against the modes supported by the installed Inductor backend."""
     from torch._inductor import list_mode_options
 
-    value = (os.environ if environ is None else environ).get('GR00T_COMPILE_MODE', 'default')
+    value = (os.environ if environ is None else environ).get('GR00T_COMPILE_MODE', 'max-autotune-no-cudagraphs')
     supported = list_mode_options()
     if value not in supported:
         raise ValueError(

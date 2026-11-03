@@ -51,7 +51,7 @@ def _reject_existing_wrappers(modules) -> None:
             raise RuntimeError("This PyTorch build lacks Module.compile()")
 
 
-def compile_dit_blocks(model: nn.Module, *, enabled: bool = False, mode: str = "default") -> list[str]:
+def compile_dit_blocks(model: nn.Module, *, enabled: bool = False, mode: str = "max-autotune-no-cudagraphs") -> list[str]:
     """Install lazy wrappers, preserving module identity and checkpoint keys.
 
     Turning compilation off or changing modes after installation requires a new
@@ -84,7 +84,7 @@ def compile_dit_blocks(model: nn.Module, *, enabled: bool = False, mode: str = "
     return paths
 
 
-def compile_dit_model(model: nn.Module, *, enabled: bool = False, mode: str = "default") -> list[str]:
+def compile_dit_model(model: nn.Module, *, enabled: bool = False, mode: str = "max-autotune-no-cudagraphs") -> list[str]:
     """Compile the whole action DiT instance (``action_head.model``) as one region."""
     installed = _check_installed(model, "model" if enabled else None, mode)
     if installed is not None:
@@ -116,7 +116,7 @@ def compile_dit_model(model: nn.Module, *, enabled: bool = False, mode: str = "d
 
 
 def install_dit_compile(
-    model: nn.Module, *, blocks: bool = False, whole: bool = False, mode: str = "default"
+    model: nn.Module, *, blocks: bool = False, whole: bool = False, mode: str = "max-autotune-no-cudagraphs"
 ) -> list[str]:
     """Single entry point; per-block and whole-DiT compilation are mutually exclusive."""
     if blocks and whole:
@@ -173,7 +173,7 @@ def _preflight_targets(model: nn.Module, targets) -> None:
 def install_model_compile(
     model: nn.Module, *, blocks: bool = False, whole: bool = False,
     text_layers: bool = False, text_forwards: bool = False, vl_blocks: bool = False,
-    mode: str = "default",
+    mode: str = "max-autotune-no-cudagraphs",
 ) -> list[str]:
     """Install independently selected scopes, with a single preflight before mutation.
 

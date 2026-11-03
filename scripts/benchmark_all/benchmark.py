@@ -21,24 +21,21 @@ DATA = Path('/workspace/data')
 RUNTIME = {'GR00T_PIXEL_VALUES_BF16': '1', 'GR00T_APEX_FUSED_ADAM': '1', 'GR00T_ZERO2_OVERLAP': '1'}
 CASES = {
     'baseline': {},
-    # 'pixel_bf16': {'GR00T_PIXEL_VALUES_BF16': '1'},         # 输入图像提前转 BF16
-    # 'fused_adam': {'GR00T_APEX_FUSED_ADAM': '1'},           # 使用 Apex 融合 AdamW 优化器
-    # 'gro': {'GR00T_ZERO2_OVERLAP': '1'},                    # 梯度归约与反向计算重叠
-    # 'obr': {'GR00T_ZERO2_REDUCE_SCATTER': '1'},             # 按梯度所属参数分片的 owner 归约
-    # 'allgather': {'GR00T_ZERO2_ALLGATHER_PIPELINE': '1'},   # 参数更新与 AllGather 流水重叠
-    # 'vl': {'GR00T_COMPILE_VARIANT': 'vl'},                  # 启用 VL 自注意力模块编译
-    # 'dit_model': {'GR00T_COMPILE_VARIANT': 'dit-model'},          # 启用整体动作 DiT 编译
-    # 'dit_vl': {'GR00T_COMPILE_VARIANT': 'dit-model-vl'},    # 同时启用整体 DiT 和 VL 编译
-    # 'dit_blocks': {'GR00T_COMPILE_VARIANT': 'dit-blocks'},  # 动作 DiT 的 32 个 Block 逐块编译
-    # 'text_layers': {'GR00T_COMPILE_VARIANT': 'text-layers'},      # 文本 Decoder 的 16 层按完整模块编译
-    # 'text_forwards': {'GR00T_COMPILE_VARIANT': 'text-forwards'},  # 文本层仅编译 forward，按类型共享编译函数
-    # 'combo_runtime': dict(RUNTIME),                                      # 已确认有效的运行时组合
-    # 'combo_dit': {**RUNTIME, 'GR00T_COMPILE_VARIANT': 'dit-model'},      # 运行时组合 + 整体 DiT 编译
-    # 'combo_full': {**RUNTIME, 'GR00T_COMPILE_VARIANT': 'dit-model-vl'},  # 运行时组合 + 整体 DiT/VL 编译
-    # 'combo_text_layers': {**RUNTIME, 'GR00T_COMPILE_VARIANT': 'text-layers'},      # 运行时组合 + 文本层模块编译
-    # 'combo_text_forwards': {**RUNTIME, 'GR00T_COMPILE_VARIANT': 'text-forwards'},  # 运行时组合 + 文本层 forward 编译
-    # 'combo_allgather': {**RUNTIME, 'GR00T_COMPILE_VARIANT': 'dit-model-vl',
-    #                     'GR00T_ZERO2_ALLGATHER_PIPELINE': '1'},          # combo_full + AllGather 流水
+    'pixel_bf16': {'GR00T_PIXEL_VALUES_BF16': '1'},         # 输入图像提前转 BF16
+    'fused_adam': {'GR00T_APEX_FUSED_ADAM': '1'},           # 使用 Apex 融合 AdamW 优化器
+    'gro': {'GR00T_ZERO2_OVERLAP': '1'},                    # 梯度归约与反向计算重叠
+    'obr': {'GR00T_ZERO2_REDUCE_SCATTER': '1'},             # 按梯度所属参数分片的 owner 归约
+    'allgather': {'GR00T_ZERO2_ALLGATHER_PIPELINE': '1'},   # 参数更新与 AllGather 流水重叠
+    'vl': {'GR00T_COMPILE_VARIANT': 'vl'},                  # 启用 VL 自注意力模块编译
+    'dit_model': {'GR00T_COMPILE_VARIANT': 'dit-model'},          # 启用整体动作 DiT 编译
+    'dit_vl': {'GR00T_COMPILE_VARIANT': 'dit-model-vl'},    # 同时启用整体 DiT 和 VL 编译
+    'dit_blocks': {'GR00T_COMPILE_VARIANT': 'dit-blocks'},  # 动作 DiT 的 32 个 Block 逐块编译
+    'text_layers': {'GR00T_COMPILE_VARIANT': 'text-layers'},      # 文本 Decoder 的 16 层按完整模块编译
+    'text_forwards': {'GR00T_COMPILE_VARIANT': 'text-forwards'},  # 文本层仅编译 forward，按类型共享编译函数
+    'combo_runtime': dict(RUNTIME),                                      # 已确认有效的运行时组合
+    'combo_dit': {**RUNTIME, 'GR00T_COMPILE_VARIANT': 'dit-model'},      # 运行时组合 + 整体 DiT 编译
+    'combo_text_layers': {**RUNTIME, 'GR00T_COMPILE_VARIANT': 'text-layers'},      # 运行时组合 + 文本层模块编译
+    'combo_text_forwards': {**RUNTIME, 'GR00T_COMPILE_VARIANT': 'text-forwards'},  # 运行时组合 + 文本层 forward 编译
     'combo_obr': {**RUNTIME, 'GR00T_ZERO2_REDUCE_SCATTER': '1'},
     'combo_obr_dit_vl': {**RUNTIME, 'GR00T_ZERO2_REDUCE_SCATTER': '1',
                          'GR00T_COMPILE_VARIANT': 'dit-model-vl'},

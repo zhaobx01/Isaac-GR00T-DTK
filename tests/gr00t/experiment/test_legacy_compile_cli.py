@@ -45,7 +45,7 @@ def test_config_defaults_and_launch_passthrough():
     training = TrainingConfig()
     for field in FIELDS:
         assert getattr(ft, field) == getattr(training, field) == (
-            "default" if field == "compile_mode" else False
+            "max-autotune-no-cudagraphs" if field == "compile_mode" else False
         )
     ft.compile_dit_model = True
     ft.compile_vl_self_attention_blocks = True

@@ -74,7 +74,7 @@ def test_scope_dispatch(model_setup, variant, count, boundary):
     assert len(info['paths']) == count
     assert info['boundaries'] == dict.fromkeys(info['paths'], boundary)
     assert len(calls) == (1 if boundary == 'forward' else count)
-    assert all(c[0] == boundary and c[2] == {'mode': 'default', 'fullgraph': False}
+    assert all(c[0] == boundary and c[2] == {'mode': 'max-autotune-no-cudagraphs', 'fullgraph': False}
                for c in calls)
     assert not info['failed'] and info['installation_only']
     assert model_compile.install(model, variant) == info

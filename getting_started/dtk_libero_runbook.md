@@ -1364,3 +1364,94 @@ BASE、8 卡、全局 batch 768、每卡 96、BF16、ZeRO-2。`GR00T_PIXEL_VALUE
 | on（提前转 BF16） | 629.138 | 628.297 | **628.718** | **+8.29%** | 两轮有效 |
 
 **数据加载等待：** off、on 各独立运行 30 步，统计第 21–30 步主线程 `next(epoch_iterator)` 的墙钟等待。8 个 rank 的各自中位数范围分别为 off **0.134–0.189 ms**、on **0.138–0.151 ms**；最大单次等待分别为 **0.265 ms** 和 **0.240 ms**。[独立测速归档](../../data/benchmarks/optimizations/data-loading-b768/pixel-values-bf16-speed/)包含逐轮数据、诊断结果、源码快照和资源监控；[测速报告](../../data/benchmarks/optimizations/data-loading-b768/pixel-values-bf16-speed/report.md)列出逐 rank 等待统计。
+
+### 8.4 DCU GEMM 自动化选优与内核加速
+
+在 DTK 环境下，可通过 `rocblas` 自带的自动化选优工具（`auto_select_tools`）对模型中的 GEMM 尺寸进行内核搜索与调优，产出比原库更优的配置文件，以进一步提升训练吞吐。
+
+#### 8.4.1 工具目录与前置条件
+
+- **工具路径**：`$DTKROOT/lib/rocblas/auto_select_test/auto_select_tools`（默认 `$DTKROOT` 为 `/opt/dtk`）
+- **二进制权限**：DTK 自带的 `rocblas-bench` 可能缺少执行权限，运行前需确保：
+  ```bash
+  chmod +x /opt/dtk/lib/rocblas/benchmark_tool/rocblas-bench
+  ```
+- **环境要求**：
+  - 目标卡必须空闲（通过 `rocm-smi --showuse` 确认 HCU 占用率接近 0%）。
+  - 系统负载（Load Average）不宜过高（建议低于 CPU 核数的五分之一），以防影响小 size 计时精度。
+
+#### 8.4.2 自动化一键脚本
+
+项目提供了封装好的自动化选优一键脚本：[dcu_gemm_autotune.sh](dcu_gemm_autotune.sh)。支持环境检查、输入准备、配置修改、选优执行与结果汇总。
+
+**主要子命令与完整示例：**
+1. **环境检查**：
+   ```bash
+   ./dcu_gemm_autotune.sh check
+   ```
+2. **抓取真实训练中的 GEMM 调用（Layer3）**：
+   将训练脚本中的 `MAX_STEPS` 设为 `5`（仅抓取前几步的 size），结合 `capture` 命令收集底层 `rocblas-bench` 调用：
+   ```bash
+   cd /workspace/Isaac-GR00T/getting_started/optimization
+   ./dcu_gemm_autotune.sh capture --layer 3 --out /tmp/train_layer3.log -- bash -c '
+     cd /workspace/Isaac-GR00T
+
+     export NUM_GPUS=8
+     export GLOBAL_BATCH_SIZE=768
+     export MAX_STEPS=5
+     export DATALOADER_NUM_WORKERS=4
+     export USE_WANDB=0
+     export MASTER_PORT=29517
+     export VLM_MODEL_PATH=/workspace/data/checkpoints/nvidia/Cosmos-Reason2-2B
+     export HF_HUB_OFFLINE=1
+     export TRANSFORMERS_OFFLINE=1
+     export BASE_MODEL=/workspace/data/checkpoints/GR00T-N1.7-3B-local-cosmos
+     export DATASET=/workspace/data/libero_10_no_noops_1.0.0_lerobot_h264
+     export GR00T_COMPILE_VISION_BLOCKS=1
+     export GR00T_FLASH_ATTN_DYNAMO_DISABLE=1
+     export GR00T_VISION_PATCH_EMBED_CHANNELS_LAST=1
+     export GR00T_COMPILE_SEQUENCE_POLICY=pad-156
+
+     bash examples/finetune.sh \
+         --base-model-path "$BASE_MODEL" \
+         --dataset-path "$DATASET" \
+         --embodiment-tag LIBERO_PANDA \
+         --output-dir /tmp/capture_out \
+         --state-dropout-prob 0.2 \
+         --save-only-model \
+         -- \
+         --gradient-accumulation-steps 1 \
+         --log-step-metrics \
+         --save-strategy no \
+         --no-save-final-model \
+         --no-check-numerics \
+         --no-enable-profiling
+   '
+   ```
+   抓取的是训练实际调用的 GEMM size，作为选优工具的输入。`capture` 只保存原始日志；日志清理去重、改配置都由下一步 `run` 自动完成。
+3. **全流程选优（以 Layer3 日志输入、8 卡并行）**：
+   ```bash
+   # 使用真实 Layer3 日志、8 卡并行选优
+   cd /workspace/Isaac-GR00T/getting_started/optimization
+   ./dcu_gemm_autotune.sh run --source layer3 --input /tmp/train_layer3.log --gpus "0 1 2 3 4 5 6 7"
+   
+   # 中断续跑
+   cd /workspace/Isaac-GR00T/getting_started/optimization
+   ./dcu_gemm_autotune.sh run --resume
+   ```
+
+#### 8.4.3 选优结果与生效方式
+
+选优完成后，脚本会自动汇总 `merged_results_*.csv`，统计提升、变慢和持平的 size 数量及 `gflops_ratio`。
+
+- **最优配置路径**：
+  `$DTKROOT/lib/rocblas/auto_select_test/auto_select_tools/optimization_configs/new/config/library_gpu5/`（BW 平台对应 `library_gpu5`）
+- **验证方式（临时生效，仅限当前终端）**：
+  ```bash
+  export ROCBLAS_TENSILE_LIBPATH=/opt/dtk/lib/rocblas/auto_select_test/auto_select_tools/optimization_configs/new/config/library_gpu5
+  ```
+- **永久替换（需先备份原库）**：
+  ```bash
+  cp -r /opt/dtk/lib/rocblas/library_gpu5 /opt/dtk/lib/rocblas/library_gpu5.bak
+  cp /opt/dtk/lib/rocblas/auto_select_test/auto_select_tools/optimization_configs/new/config/library_gpu5/G* /opt/dtk/lib/rocblas/library_gpu5/
+  ```

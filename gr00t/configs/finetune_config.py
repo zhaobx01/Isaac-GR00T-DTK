@@ -154,7 +154,7 @@ class FinetuneConfig:
     compile_vl_self_attention_blocks: bool = False
     """Compile the four visual-language self-attention blocks."""
 
-    compile_mode: str = "default"
+    compile_mode: str = "max-autotune-no-cudagraphs"
     """torch.compile mode for legacy CLI scopes; do not combine with the env selector."""
 
     log_step_metrics: bool = False

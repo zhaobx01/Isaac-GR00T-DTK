@@ -43,12 +43,12 @@ def setup_model(monkeypatch):
     return model, calls
 
 
-def test_mode_default_unchanged(setup_model):
+def test_mode_default_is_max_autotune_no_cudagraphs(setup_model):
     model, calls = setup_model
     info = model_compile.install(model, "dit-model-vl")
-    assert info["mode"] == "default"
+    assert info["mode"] == "max-autotune-no-cudagraphs"
     assert len(calls) == 5
-    assert all(kwargs == {"mode": "default", "fullgraph": False} for _, kwargs in calls)
+    assert all(kwargs == {"mode": "max-autotune-no-cudagraphs", "fullgraph": False} for _, kwargs in calls)
 
 
 @pytest.mark.parametrize("mode", ["reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
