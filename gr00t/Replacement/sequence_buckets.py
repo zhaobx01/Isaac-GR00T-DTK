@@ -28,10 +28,20 @@ def resolve_policy(environ=None):
     return policy, path, diagnostic == "1"
 
 
-ADAPTER_VARIANTS = ("vl", "dit-model", "dit-model-vl")
+ADAPTER_VARIANTS = ("vl", "dit-model", "dit-model+vl")
+_VL_BLOCK_PREFIX = "action_head.vl_self_attention.transformer_blocks."
 
 
-def validate_activation(policy, diagnostic, variant, legacy):
+def adapter_kind(path):
+    """Map a compile target to its adapter kind; reject paths the adapter cannot handle."""
+    if path == "action_head.model":
+        return "dit"
+    if path.startswith(_VL_BLOCK_PREFIX):
+        return "vl"
+    raise ValueError(f"Sequence adapter does not support compile target {path!r}")
+
+
+def validate_activation(policy, diagnostic, variant):
     """Fixed padding acts on trainer inputs and works with any compile selection.
 
     Dynamic buckets and diagnostics wrap compiled VL/DiT callables, so they need one of
@@ -39,9 +49,9 @@ def validate_activation(policy, diagnostic, variant, legacy):
     """
     if policy != "dynamic-buckets" and not diagnostic:
         return
-    if legacy is not None:
-        raise ValueError("Sequence diagnostics and dynamic buckets do not support legacy CLI compilation")
-    if variant not in ADAPTER_VARIANTS:
+    from gr00t.Replacement.model_compile import as_scopes
+
+    if as_scopes(variant).name not in ADAPTER_VARIANTS:
         raise ValueError(
             "Sequence diagnostics and dynamic buckets require one of "
             f"{', '.join(ADAPTER_VARIANTS)}"

@@ -26,29 +26,49 @@ CASES = {
     'gro': {'GR00T_ZERO2_OVERLAP': '1'},                    # 梯度归约与反向计算重叠
     'obr': {'GR00T_ZERO2_REDUCE_SCATTER': '1'},             # 按梯度所属参数分片的 owner 归约
     'allgather': {'GR00T_ZERO2_ALLGATHER_PIPELINE': '1'},   # 参数更新与 AllGather 流水重叠
-    'vl': {'GR00T_COMPILE_VARIANT': 'vl'},                  # 启用 VL 自注意力模块编译
-    'dit_model': {'GR00T_COMPILE_VARIANT': 'dit-model'},          # 启用整体动作 DiT 编译
-    'dit_vl': {'GR00T_COMPILE_VARIANT': 'dit-model-vl'},    # 同时启用整体 DiT 和 VL 编译
-    'dit_blocks': {'GR00T_COMPILE_VARIANT': 'dit-blocks'},  # 动作 DiT 的 32 个 Block 逐块编译
-    'text_layers': {'GR00T_COMPILE_VARIANT': 'text-layers'},      # 文本 Decoder 的 16 层按完整模块编译
-    'text_forwards': {'GR00T_COMPILE_VARIANT': 'text-forwards'},  # 文本层仅编译 forward，按类型共享编译函数
+    'vl': {'GR00T_COMPILE_VL': '1'},                        # 启用 VL 自注意力模块编译
+    'dit_model': {'GR00T_COMPILE_DIT': 'model'},            # 启用整体动作 DiT 编译
+    'dit_vl': {'GR00T_COMPILE_DIT': 'model', 'GR00T_COMPILE_VL': '1'},  # 同时启用整体 DiT 和 VL 编译
+    'dit_blocks': {'GR00T_COMPILE_DIT': 'blocks'},          # 动作 DiT 的 32 个 Block 逐块编译
+    'text_layers': {'GR00T_COMPILE_TEXT': 'layers'},        # 文本 Decoder 的 16 层按完整模块编译
+    'text_forwards': {'GR00T_COMPILE_TEXT': 'forwards'},    # 文本层仅编译 forward，按类型共享编译函数
     'combo_runtime': dict(RUNTIME),                                      # 已确认有效的运行时组合
-    'combo_dit': {**RUNTIME, 'GR00T_COMPILE_VARIANT': 'dit-model'},      # 运行时组合 + 整体 DiT 编译
-    'combo_text_layers': {**RUNTIME, 'GR00T_COMPILE_VARIANT': 'text-layers'},      # 运行时组合 + 文本层模块编译
-    'combo_text_forwards': {**RUNTIME, 'GR00T_COMPILE_VARIANT': 'text-forwards'},  # 运行时组合 + 文本层 forward 编译
+    'combo_dit': {**RUNTIME, 'GR00T_COMPILE_DIT': 'model'},              # 运行时组合 + 整体 DiT 编译
+    'combo_text_layers': {**RUNTIME, 'GR00T_COMPILE_TEXT': 'layers'},    # 运行时组合 + 文本层模块编译
+    'combo_text_forwards': {**RUNTIME, 'GR00T_COMPILE_TEXT': 'forwards'},  # 运行时组合 + 文本层 forward 编译
     'combo_obr': {**RUNTIME, 'GR00T_ZERO2_REDUCE_SCATTER': '1'},
     'combo_obr_dit_vl': {**RUNTIME, 'GR00T_ZERO2_REDUCE_SCATTER': '1',
-                         'GR00T_COMPILE_VARIANT': 'dit-model-vl'},
-    'combo_obr_dit_vl_text': {**RUNTIME, 'GR00T_ZERO2_REDUCE_SCATTER': '1'},
+                         'GR00T_COMPILE_DIT': 'model', 'GR00T_COMPILE_VL': '1'},
+    'combo_obr_dit_vl_text': {**RUNTIME, 'GR00T_ZERO2_REDUCE_SCATTER': '1',
+                              'GR00T_COMPILE_DIT': 'model', 'GR00T_COMPILE_VL': '1',
+                              'GR00T_COMPILE_TEXT': 'forwards'},
     'combo_obr_dit_vl_text_allgather': {**RUNTIME, 'GR00T_ZERO2_REDUCE_SCATTER': '1',
-                                        'GR00T_ZERO2_ALLGATHER_PIPELINE': '1'},
+                                        'GR00T_ZERO2_ALLGATHER_PIPELINE': '1',
+                                        'GR00T_COMPILE_DIT': 'model', 'GR00T_COMPILE_VL': '1',
+                                        'GR00T_COMPILE_TEXT': 'forwards'},
 }
 
 
-LEGACY_COMPILE_CASES = {'combo_obr_dit_vl_text', 'combo_obr_dit_vl_text_allgather'}
-LEGACY_COMPILE_FLAGS = ['--compile-dit-model', '--compile-vl-self-attention-blocks',
-                        '--compile-text-layer-forwards']
-DEFAULTS = {'GR00T_COMPILE_VISION_BLOCKS': '1', 'GR00T_FLASH_ATTN_DYNAMO_DISABLE': '1', 'GR00T_VISION_PATCH_EMBED_CHANNELS_LAST': '1', 'GR00T_PIXEL_VALUES_BF16': '0', 'GR00T_APEX_FUSED_ADAM': '0', 'GR00T_ZERO2_OVERLAP': '0', 'GR00T_ZERO2_REDUCE_SCATTER': '0', 'GR00T_ZERO2_ALLGATHER_PIPELINE': '0', 'GR00T_ZERO2_PACK_TIMING': '0', 'GR00T_COMPILE_VARIANT': 'off', 'GR00T_COMPILE_SEQUENCE_POLICY': 'pad-156'}
+def compile_expectation(env):
+    """Canonical variant name and ordered {path: boundary}, mirroring gr00t.Replacement.model_compile."""
+    dit, vl, text = env['GR00T_COMPILE_DIT'], env['GR00T_COMPILE_VL'] == '1', env['GR00T_COMPILE_TEXT']
+    paths, parts = {}, []
+    if vl:
+        parts.append('vl')
+        paths.update({f'action_head.vl_self_attention.transformer_blocks.{i}': 'module' for i in range(4)})
+    if dit == 'model':
+        parts.insert(0, 'dit-model')
+        paths['action_head.model'] = 'module'
+    elif dit == 'blocks':
+        parts.insert(0, 'dit-blocks')
+        paths.update({f'action_head.model.transformer_blocks.{i}': 'module' for i in range(32)})
+    if text != 'off':
+        parts.append(f'text-{text}')
+        paths.update({f'backbone.model.language_model.layers.{i}': 'forward' if text == 'forwards' else 'module' for i in range(16)})
+    return '+'.join(parts) or 'off', paths
+
+
+DEFAULTS = {'GR00T_COMPILE_VISION_BLOCKS': '1', 'GR00T_FLASH_ATTN_DYNAMO_DISABLE': '1', 'GR00T_VISION_PATCH_EMBED_CHANNELS_LAST': '1', 'GR00T_PIXEL_VALUES_BF16': '0', 'GR00T_APEX_FUSED_ADAM': '0', 'GR00T_ZERO2_OVERLAP': '0', 'GR00T_ZERO2_REDUCE_SCATTER': '0', 'GR00T_ZERO2_ALLGATHER_PIPELINE': '0', 'GR00T_ZERO2_PACK_TIMING': '0', 'GR00T_COMPILE_DIT': 'off', 'GR00T_COMPILE_VL': '0', 'GR00T_COMPILE_TEXT': 'off', 'GR00T_COMPILE_SEQUENCE_POLICY': 'pad-156'}
 
 def measure(records):
     if len(records) != 8 or {r.get('rank') for r in records} != set(range(8)) or any(r.get('world_size') != 8 for r in records):
@@ -136,18 +156,19 @@ def wait_for_idle_gpus(log_path, *, query=device_check, sleep=time.sleep):
 
 def validate_run(run, case, records):
     env = {**DEFAULTS, **CASES[case]}
-    expected = {'zero2_allgather_pipeline': env['GR00T_ZERO2_ALLGATHER_PIPELINE'] == '1', 'zero2_overlap': env['GR00T_ZERO2_OVERLAP'] == '1', 'zero2_reduce_scatter': env['GR00T_ZERO2_REDUCE_SCATTER'] == '1', 'compile_variant': 'legacy-cli' if case in LEGACY_COMPILE_CASES else env['GR00T_COMPILE_VARIANT'], 'global_batch_size': 768, 'num_gpus': 8}
+    compile_name, compile_paths = compile_expectation(env)
+    expected = {'zero2_allgather_pipeline': env['GR00T_ZERO2_ALLGATHER_PIPELINE'] == '1', 'zero2_overlap': env['GR00T_ZERO2_OVERLAP'] == '1', 'zero2_reduce_scatter': env['GR00T_ZERO2_REDUCE_SCATTER'] == '1', 'compile_variant': compile_name, 'global_batch_size': 768, 'num_gpus': 8}
     for record in records:
         info = record.get('run_info', {})
         for key, value in expected.items():
             if info.get(key) != value:
                 raise ValueError(f'rank {record.get("rank")} effective {key}: {info.get(key)!r} != {value!r}')
-        if env['GR00T_COMPILE_VARIANT'] != 'off' and not info.get('compiled_paths'):
-            raise ValueError('compile enabled but no compiled paths reported')
-        if case in LEGACY_COMPILE_CASES:
-            required = {'action_head.model'} | {f'action_head.vl_self_attention.transformer_blocks.{i}' for i in range(4)} | {f'backbone.model.language_model.layers.{i}' for i in range(16)}
-            if not required.issubset(set(info.get('compiled_paths') or [])):
-                raise ValueError('legacy compile missing required compiled paths')
+        if list(info.get('compiled_paths') or []) != list(compile_paths):
+            raise ValueError(f'rank {record.get("rank")} compiled paths differ from expected {compile_name} targets')
+        if compile_paths:
+            manifest = run / 'compilation' / f'rank-{record.get("rank"):02d}.json'
+            if not manifest.exists() or json.loads(manifest.read_text()).get('boundaries') != compile_paths:
+                raise ValueError(f'rank {record.get("rank")} compile boundaries differ from expected {compile_name}')
     log = (run / 'train.log').read_text(errors='replace')
     if env['GR00T_PIXEL_VALUES_BF16'] == '1' and 'pixel_values is cast to BF16 in DataLoader workers' not in log:
         raise ValueError('BF16 pixel collator activation not observed')
@@ -173,8 +194,6 @@ def build_command(run, *, trace=False, case=None):
            '--save-only-model', '--', '--gradient-accumulation-steps', '1',
            '--log-step-metrics', '--save-strategy', 'no', '--no-save-final-model',
            '--no-check-numerics']
-    if case in LEGACY_COMPILE_CASES:
-        cmd += LEGACY_COMPILE_FLAGS
     if trace:
         # First active training step = skip_first + wait + warmup + 1 = 35.
         cmd += ['--enable-profiling', '--profiler-skip-first', '28', '--profiler-wait', '1',
@@ -381,16 +400,14 @@ def load_resume_rows(root, *, rounds=None):
             if changed:
                 detail = 'sequence policy ' if 'GR00T_COMPILE_SEQUENCE_POLICY' in changed else ''
                 raise ValueError(f'{detail}configuration changed for {case}-{n}: {changed}; use a new output directory')
-            if case in LEGACY_COMPILE_CASES and not all(flag in launch_data.get('command', []) for flag in LEGACY_COMPILE_FLAGS):
-                raise ValueError(f'compile configuration changed for {case}-{n}; use a new output directory')
         else:
             raise ValueError(f'cannot verify sequence policy for {case}-{n}; use a new output directory')
     return rows
 
 
-def pending_runs(cases, rounds, rows):
+def pending_runs(cases, rounds, rows, trace=True):
     completed = {(row['case'], row['round']) for row in rows}
-    return [(case, n) for case in cases for n in [*range(1, rounds + 1), 'trace']
+    return [(case, n) for case in cases for n in [*range(1, rounds + 1), *(['trace'] if trace else [])]
             if (case, n) not in completed]
 
 
@@ -401,6 +418,7 @@ def main():
     parser.add_argument('--cases', nargs='+', choices=list(CASES), default=list(CASES))
     parser.add_argument('--sequence-policy', choices=('auto', 'pad-156', 'pad-152-156'),
                         help='override the default sequence policy for this run')
+    parser.add_argument('--no-trace', action='store_true', help='skip the Trace run for every case')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--resume', action='store_true', help='continue missing runs in a new-layout directory')
     args = parser.parse_args()
@@ -411,7 +429,7 @@ def main():
     if args.dry_run:
         rows = load_resume_rows(args.output, rounds=args.rounds) if args.resume else []
         print(json.dumps({'completed': len(rows),
-                          'pending': pending_runs(args.cases, args.rounds, rows),
+                          'pending': pending_runs(args.cases, args.rounds, rows, not args.no_trace),
                           'environments': {c: {**DEFAULTS, **CASES[c]} for c in args.cases},
                           'commands': {c: build_command(Path('/tmp/benchmark-preview') / c, case=c) for c in args.cases},
                           'trace': {'step': 35, 'with_stack': True, 'ranks': list(range(8))}},
@@ -454,7 +472,7 @@ def _run_benchmarks(args, root):
         (root / 'metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
         write_report(root, rows)
     # Check all pending directories before launching any training.
-    pending = pending_runs(args.cases, args.rounds, rows)
+    pending = pending_runs(args.cases, args.rounds, rows, not getattr(args, 'no_trace', False))
     for case, n in pending:
         run = root / case / f'{case}-{n}'
         if run.exists():

@@ -80,7 +80,7 @@ def test_independent_switches(setup_baseline, vision, flash):
     s = setup_baseline
     info = extension.install_baseline_overrides(s.backbone(), {
         'GR00T_COMPILE_VISION_BLOCKS': vision, 'GR00T_FLASH_ATTN_DYNAMO_DISABLE': flash,
-        'GR00T_COMPILE_VARIANT': 'off', 'GR00T_COMPILE_MODE': 'reduce-overhead'})
+        'GR00T_COMPILE_MODE': 'reduce-overhead'})
     assert bool(s.calls) == (vision == '1')
     assert (s.flash.flash_attention_forward is not s.original) == (flash == '1')
     assert info['installed']['vision_blocks'] == (vision == '1')

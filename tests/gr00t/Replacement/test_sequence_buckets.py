@@ -90,18 +90,19 @@ def test_same_bucket_reuses_compiled_graph_for_distinct_sequence_lengths():
     assert len(compiled_graphs) == 1
 
 
-def test_opt_in_rejects_legacy_or_incomplete_compile_scopes():
-    with pytest.raises(ValueError, match="legacy"):
-        sequence_buckets.validate_activation("dynamic-buckets", False, "off", {"whole": True})
+def test_opt_in_rejects_incomplete_compile_scopes():
     for variant in ("off", "dit-blocks", "text-layers", "text-forwards"):
         with pytest.raises(ValueError, match="require one of"):
-            sequence_buckets.validate_activation("dynamic-buckets", False, variant, None)
+            sequence_buckets.validate_activation("dynamic-buckets", False, variant)
         with pytest.raises(ValueError, match="require one of"):
-            sequence_buckets.validate_activation("auto", True, variant, None)
-    for variant in ("vl", "dit-model", "dit-model-vl"):
-        sequence_buckets.validate_activation("dynamic-buckets", False, variant, None)
-        sequence_buckets.validate_activation("auto", True, variant, None)
-    sequence_buckets.validate_activation("auto", False, "off", {"whole": True})
+            sequence_buckets.validate_activation("auto", True, variant)
+    for variant in ("dit-model+vl+text-forwards", "dit-blocks+vl", "vl+text-layers"):
+        with pytest.raises(ValueError, match="require one of"):
+            sequence_buckets.validate_activation("dynamic-buckets", False, variant)
+    for variant in ("vl", "dit-model", "dit-model+vl", "dit-model-vl"):
+        sequence_buckets.validate_activation("dynamic-buckets", False, variant)
+        sequence_buckets.validate_activation("auto", True, variant)
+    sequence_buckets.validate_activation("auto", False, "off")
 
 
 @pytest.mark.parametrize("policy", ["pad-152-156", "pad-156"])
@@ -109,8 +110,17 @@ def test_opt_in_rejects_legacy_or_incomplete_compile_scopes():
     "off", "vl", "dit-model", "dit-model-vl", "dit-blocks", "text-layers", "text-forwards",
 ])
 def test_fixed_padding_allowed_with_any_compile_variant(policy, variant):
-    sequence_buckets.validate_activation(policy, False, variant, None)
-    sequence_buckets.validate_activation(policy, False, "off", {"whole": True})
+    sequence_buckets.validate_activation(policy, False, variant)
+
+
+def test_adapter_kind_rejects_unsupported_targets():
+    assert sequence_buckets.adapter_kind("action_head.model") == "dit"
+    assert sequence_buckets.adapter_kind(
+        "action_head.vl_self_attention.transformer_blocks.3") == "vl"
+    for path in ("action_head.model.transformer_blocks.0",
+                 "backbone.model.language_model.layers.0"):
+        with pytest.raises(ValueError, match="does not support"):
+            sequence_buckets.adapter_kind(path)
 
 
 def test_diagnostics_record_original_batch_shape_and_exact_step(tmp_path):

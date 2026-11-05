@@ -63,12 +63,6 @@ class TrainingConfig:
     bf16: bool = True
     check_numerics: bool = False
     log_step_metrics: bool = False
-    compile_dit_blocks: bool = False
-    compile_dit_model: bool = False
-    compile_text_layers: bool = False
-    compile_text_layer_forwards: bool = False
-    compile_vl_self_attention_blocks: bool = False
-    compile_mode: str = "max-autotune-no-cudagraphs"
     eval_bf16: bool = True
 
     # Logging and saving

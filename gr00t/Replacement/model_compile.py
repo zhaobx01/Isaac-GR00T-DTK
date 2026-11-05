@@ -7,12 +7,11 @@ import logging
 import os
 import types
 from collections.abc import MutableMapping
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from threading import RLock
 
-VARIANTS = ('off', 'vl', 'dit-model', 'dit-model-vl', 'dit-blocks',
-            'text-layers', 'text-forwards')
 _STATE = '_gr00t_optional_compile'
 _FORWARD_TAG = '_gr00t_compiled_forward'
 _BASELINE_PROCESS = None
@@ -175,26 +174,115 @@ def write_baseline_manifest(output_dir, info):
     temporary.replace(path)
 
 
+DIT_MODES = ('off', 'model', 'blocks')
+TEXT_MODES = ('off', 'layers', 'forwards')
+_SCOPE_ENV = {'dit': 'GR00T_COMPILE_DIT', 'vl': 'GR00T_COMPILE_VL', 'text': 'GR00T_COMPILE_TEXT'}
+
+
+@dataclass(frozen=True)
+class CompileScopes:
+    """Independent compile scopes; mutually exclusive choices share one field.
+
+    Process-internal only: serialize ``name`` or ``as_dict()``, never the instance.
+    """
+    dit: str = 'off'
+    vl: bool = False
+    text: str = 'off'
+
+    def __post_init__(self):
+        if self.dit not in DIT_MODES:
+            raise ValueError(f'{_SCOPE_ENV["dit"]} must be one of {DIT_MODES}, got {self.dit!r}')
+        if self.text not in TEXT_MODES:
+            raise ValueError(f'{_SCOPE_ENV["text"]} must be one of {TEXT_MODES}, got {self.text!r}')
+        if not isinstance(self.vl, bool):
+            raise ValueError(f'{_SCOPE_ENV["vl"]} must be 0 or 1')
+
+    @property
+    def enabled(self):
+        return self != CompileScopes()
+
+    @property
+    def name(self):
+        parts = []
+        if self.dit != 'off':
+            parts.append(f'dit-{self.dit}')
+        if self.vl:
+            parts.append('vl')
+        if self.text != 'off':
+            parts.append(f'text-{self.text}')
+        return '+'.join(parts) or 'off'
+
+    def as_dict(self):
+        return {'dit': self.dit, 'vl': '1' if self.vl else '0', 'text': self.text}
+
+
+def scopes_from_name(name):
+    """Parse ``off`` or a ``+``-joined canonical name; ``dit-model-vl`` is a legacy alias."""
+    if name == 'off':
+        return CompileScopes()
+    fields = {}
+
+    def put(key, value):
+        if key in fields:
+            raise ValueError(f'Compile scope {key!r} given twice in {name!r}')
+        fields[key] = value
+
+    for part in str(name).split('+'):
+        if part == 'vl':
+            put('vl', True)
+        elif part == 'dit-model-vl':
+            put('dit', 'model')
+            put('vl', True)
+        elif part in ('dit-model', 'dit-blocks'):
+            put('dit', part[4:])
+        elif part in ('text-layers', 'text-forwards'):
+            put('text', part[5:])
+        else:
+            raise ValueError(f'Unknown compile variant: {name!r}')
+    return CompileScopes(**fields)
+
+
+def as_scopes(value):
+    return value if isinstance(value, CompileScopes) else scopes_from_name(value)
+
+
+def resolve_scopes(environ=None):
+    """Read the GR00T_COMPILE_DIT/VL/TEXT environment variables."""
+    environ = os.environ if environ is None else environ
+    vl = environ.get(_SCOPE_ENV['vl'], '0')
+    if vl not in {'0', '1'}:
+        raise ValueError(f'{_SCOPE_ENV["vl"]} must be 0 or 1, got {vl!r}')
+    return CompileScopes(dit=environ.get(_SCOPE_ENV['dit'], 'off'), vl=vl == '1',
+                         text=environ.get(_SCOPE_ENV['text'], 'off'))
+
+
 def resolve_variant(environ=None):
-    value = (os.environ if environ is None else environ).get('GR00T_COMPILE_VARIANT', 'off')
-    if value not in VARIANTS:
-        raise ValueError(f'GR00T_COMPILE_VARIANT must be one of {VARIANTS}, got {value!r}')
-    return value
+    """Canonical scope name used in manifests and run records."""
+    return resolve_scopes(environ).name
 
 
-def expected_paths(variant):
-    if variant not in VARIANTS:
-        raise ValueError(f'Unknown compile variant: {variant}')
-    paths = []
-    if variant in ('vl', 'dit-model-vl'):
-        paths += [f'action_head.vl_self_attention.transformer_blocks.{i}' for i in range(4)]
-    if variant in ('dit-model', 'dit-model-vl'):
-        paths += ['action_head.model']
-    if variant == 'dit-blocks':
-        paths += [f'action_head.model.transformer_blocks.{i}' for i in range(32)]
-    if variant in ('text-layers', 'text-forwards'):
-        paths += [f'backbone.model.language_model.layers.{i}' for i in range(16)]
-    return paths
+def expected_boundaries(scopes):
+    """Ordered ``{path: 'module'|'forward'}`` for every compile target."""
+    scopes = as_scopes(scopes)
+    boundaries = {}
+    if scopes.vl:
+        boundaries.update(
+            dict.fromkeys((f'action_head.vl_self_attention.transformer_blocks.{i}' for i in range(4)),
+                          'module'))
+    if scopes.dit == 'model':
+        boundaries['action_head.model'] = 'module'
+    elif scopes.dit == 'blocks':
+        boundaries.update(
+            dict.fromkeys((f'action_head.model.transformer_blocks.{i}' for i in range(32)), 'module'))
+    if scopes.text != 'off':
+        boundary = 'forward' if scopes.text == 'forwards' else 'module'
+        boundaries.update(
+            dict.fromkeys((f'backbone.model.language_model.layers.{i}' for i in range(16)), boundary))
+    return boundaries
+
+
+def expected_paths(scopes):
+    return list(expected_boundaries(scopes))
 
 
 def _check_layers(layers, count, layer_type, description):
@@ -244,32 +332,36 @@ def resolve_mode(environ=None):
 
 
 def install(model, variant, *, mode=None):
-    """Preflight all targets, then install lazy instance wrappers exactly once."""
-    paths = expected_paths(variant)
+    """Preflight all targets, then install lazy instance wrappers exactly once.
+
+    ``variant`` is a ``CompileScopes`` or its canonical name (``off``, ``dit-model+vl``, ...).
+    """
+    scopes = as_scopes(variant)
+    boundaries = expected_boundaries(scopes)
+    paths = list(boundaries)
     mode = resolve_mode() if mode is None else resolve_mode({'GR00T_COMPILE_MODE': mode})
     previous = getattr(model, _STATE, None)
     if previous is not None:
-        if previous['variant'] != variant or previous['mode'] != mode or previous['failed']:
+        if previous['variant'] != scopes.name or previous['mode'] != mode or previous['failed']:
             raise RuntimeError('Compile request changed or failed; restart the process')
         return dict(previous)
-    boundary = 'forward' if variant == 'text-forwards' else 'module'
-    info = {'variant': variant, 'paths': paths, 'boundaries': dict.fromkeys(paths, boundary),
-            'mode': mode, 'fullgraph': False,
+    info = {'variant': scopes.name, 'scopes': scopes.as_dict(), 'paths': paths,
+            'boundaries': boundaries, 'mode': mode, 'fullgraph': False,
             'dynamic': 'auto', 'failed': False, 'installation_only': True}
-    if variant == 'off':
+    if not scopes.enabled:
         return info
-    if variant in ('vl', 'dit-model', 'dit-model-vl', 'dit-blocks'):
+    if scopes.vl or scopes.dit != 'off':
         from gr00t.model.modules.dit import BasicTransformerBlock, DiT
 
-    if variant in ('vl', 'dit-model-vl'):
+    if scopes.vl:
         blocks = model.action_head.vl_self_attention.transformer_blocks
         _check_layers(blocks, 4, BasicTransformerBlock, 'VL compilation')
-    if variant in ('dit-model', 'dit-model-vl', 'dit-blocks'):
+    if scopes.dit != 'off':
         dit = model.action_head.model
         if not isinstance(dit, DiT):
             raise ValueError('DiT compilation requires a DiT instance')
         _check_layers(dit.transformer_blocks, 32, BasicTransformerBlock, 'DiT compilation')
-    if variant in ('text-layers', 'text-forwards'):
+    if scopes.text != 'off':
         from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextDecoderLayer
         layers = model.get_submodule('backbone.model.language_model.layers')
         _check_layers(layers, 16, Qwen3VLTextDecoderLayer, 'Text compilation')
@@ -285,15 +377,16 @@ def install(model, variant, *, mode=None):
                     or hasattr(getattr(module, 'forward', None), '_torchdynamo_orig_callable')
                     or getattr(getattr(module, 'forward', None), _FORWARD_TAG, False)):
                 raise RuntimeError(f'Overlapping compile wrapper at {path}; restart')
-        if variant in ('text-layers', 'text-forwards'):
+        if scopes.text != 'off' and path.startswith('backbone.model.language_model.layers.'):
             _check_forward(target)
-        if boundary == 'module' and not callable(getattr(target, 'compile', None)):
+        if boundaries[path] == 'module' and not callable(getattr(target, 'compile', None)):
             raise RuntimeError('This PyTorch build does not expose Module.compile')
     info['failed'] = True
     setattr(model, _STATE, info)
     info['trace_markers'] = os.environ.get('GR00T_COMPILE_TRACE_MARKERS', '0') == '1'
     shared_forwards = {}
     for path, target in zip(paths, targets):
+        boundary = boundaries[path]
         if boundary == 'forward':
             import torch
             cls = type(target)

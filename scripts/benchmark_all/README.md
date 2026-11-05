@@ -26,7 +26,7 @@ python3 /workspace/Isaac-GR00T/scripts/benchmark_all/benchmark.py \
   --rounds 2 --resume
 ```
 
-`--cases` 必须包含 baseline，`--rounds` 至少为 2。`dit` 已改名为 `dit_model`，环境变量仍为 `GR00T_COMPILE_VARIANT=dit-model`。
+`--cases` 必须包含 baseline，`--rounds` 至少为 2。`dit` 已改名为 `dit_model`。编译范围由 `GR00T_COMPILE_DIT`（`off/model/blocks`）、`GR00T_COMPILE_VL`（`0/1`）、`GR00T_COMPILE_TEXT`（`off/layers/forwards`）三个变量叠加控制，例如 `dit_model` 为 `GR00T_COMPILE_DIT=model`。组合 case 使用 `GR00T_COMPILE_DIT=model GR00T_COMPILE_VL=1 GR00T_COMPILE_TEXT=forwards`；`validate_run` 会逐项核对 `compiled_paths` 与 manifest 的边界。
 
 后台脚本先采集当前默认策略，再采集 `auto`，分别使用输出目录及其 `-auto` 后缀目录，共用脚本打印的运行日志。两次各运行全部 case（当前分别 15 次训练）；第一轮有失败记录时仍继续第二轮，日志记录各轮退出码。恢复 auto 目录时需在原命令中加 `--sequence-policy auto --resume`；恢复默认策略目录时使用 `--resume`。
 

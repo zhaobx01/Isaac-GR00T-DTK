@@ -149,7 +149,6 @@ def test_experiment_resolves_optimizer_before_distributed_initialization(extensi
     config.training.optim = "adamw_torch"
     monkeypatch.setenv("GR00T_APEX_FUSED_ADAM", enabled)
     monkeypatch.setenv("GR00T_ZERO2_ALLGATHER_PIPELINE", "0")
-    monkeypatch.setenv("GR00T_COMPILE_VARIANT", "off")
     monkeypatch.setenv("GR00T_COMPILE_SEQUENCE_POLICY", "auto")
     monkeypatch.setenv("GR00T_COMPILE_LENGTH_DIAGNOSTICS", "0")
     monkeypatch.setenv("GR00T_ZERO2_OVERLAP", "0")

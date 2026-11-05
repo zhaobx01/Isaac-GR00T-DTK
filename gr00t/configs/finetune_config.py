@@ -139,24 +139,6 @@ class FinetuneConfig:
     check_numerics: bool = False
     """Fail on non-finite inputs, activations, gradients, optimizer states or parameters."""
 
-    compile_dit_blocks: bool = False
-    """Compile the 32 action DiT blocks; mutually exclusive with compile_dit_model."""
-
-    compile_dit_model: bool = False
-    """Compile the whole action DiT instance."""
-
-    compile_text_layers: bool = False
-    """Compile the 16 retained text decoder layer modules."""
-
-    compile_text_layer_forwards: bool = False
-    """Compile text layer forwards; mutually exclusive with compile_text_layers."""
-
-    compile_vl_self_attention_blocks: bool = False
-    """Compile the four visual-language self-attention blocks."""
-
-    compile_mode: str = "max-autotune-no-cudagraphs"
-    """torch.compile mode for legacy CLI scopes; do not combine with the env selector."""
-
     log_step_metrics: bool = False
     """Write per-rank step wall times and peak device memory to output_dir/step_metrics."""
 

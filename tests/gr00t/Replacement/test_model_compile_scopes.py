@@ -61,16 +61,26 @@ def model_setup(monkeypatch):
     return model, calls
 
 
+SINGLE_SCOPES = {
+    'dit-blocks': {'GR00T_COMPILE_DIT': 'blocks'}, 'text-layers': {'GR00T_COMPILE_TEXT': 'layers'},
+    'text-forwards': {'GR00T_COMPILE_TEXT': 'forwards'}, 'vl': {'GR00T_COMPILE_VL': '1'},
+    'dit-model': {'GR00T_COMPILE_DIT': 'model'},
+    'dit-model+vl': {'GR00T_COMPILE_DIT': 'model', 'GR00T_COMPILE_VL': '1'},
+}
+
+
 @pytest.mark.parametrize('variant,count,boundary', [
     ('dit-blocks', 32, 'module'), ('text-layers', 16, 'module'),
     ('text-forwards', 16, 'forward'), ('vl', 4, 'module'),
-    ('dit-model', 1, 'module'), ('dit-model-vl', 5, 'module'),
+    ('dit-model', 1, 'module'), ('dit-model+vl', 5, 'module'),
 ])
 def test_scope_dispatch(model_setup, variant, count, boundary):
     model, calls = model_setup
-    assert model_compile.resolve_variant({'GR00T_COMPILE_VARIANT': variant}) == variant
-    assert training_runtime.resolve_compile_variant({'GR00T_COMPILE_VARIANT': variant}) == variant
+    name = variant
+    assert model_compile.resolve_variant(SINGLE_SCOPES[variant]) == name
+    assert training_runtime.resolve_compile_variant(SINGLE_SCOPES[variant]) == name
     info = model_compile.install(model, variant)
+    assert info['variant'] == name
     assert len(info['paths']) == count
     assert info['boundaries'] == dict.fromkeys(info['paths'], boundary)
     assert len(calls) == (1 if boundary == 'forward' else count)
@@ -89,22 +99,21 @@ def test_scope_dispatch(model_setup, variant, count, boundary):
         assert all(layer.forward.__self__ is layer for layer in layers)
 
 
-@pytest.mark.parametrize('variant', ['dit-blocks', 'text-layers', 'text-forwards'])
-def test_new_scopes_conflict_with_legacy_cli(variant):
-    with pytest.raises(ValueError, match='GR00T_COMPILE_VARIANT'):
-        training_runtime.resolve_legacy_compile_request(
-            SimpleNamespace(compile_dit_blocks=True, compile_dit_model=False,
-                            compile_text_layers=False, compile_text_layer_forwards=False,
-                            compile_vl_self_attention_blocks=False, compile_mode='default'),
-            variant)
+def test_legacy_cli_removed():
+    from gr00t.configs.finetune_config import FinetuneConfig
+    from gr00t.configs.training.training_config import TrainingConfig
+    assert not hasattr(training_runtime, 'resolve_legacy_compile_request')
+    for cls in (FinetuneConfig, TrainingConfig):
+        assert not [f for f in cls.__dataclass_fields__ if f.startswith('compile_')]
+    with pytest.raises(ModuleNotFoundError):
+        __import__('gr00t.experiment.compilation')
 
 
-@pytest.mark.parametrize('bad', ['', 'text', 'dit-blocks-vl'])
+@pytest.mark.parametrize('bad', ['', 'text', 'dit-blocks-vl', 'off+vl', 'vl+vl',
+                                 'dit-model+dit-blocks', 'text-layers+text-forwards'])
 def test_invalid_variant(bad):
     with pytest.raises(ValueError):
         model_compile.expected_paths(bad)
-    with pytest.raises(ValueError):
-        training_runtime.resolve_compile_variant({'GR00T_COMPILE_VARIANT': bad})
 
 
 @pytest.mark.parametrize('variant', ['dit-blocks', 'text-layers', 'text-forwards'])
@@ -136,6 +145,19 @@ def test_foreign_forward_rejected_but_original_bound_method_allowed(model_setup)
     assert not calls
     layer.forward = types.MethodType(type(layer).forward, layer)
     model_compile.install(model, 'text-forwards')
+
+
+def test_foreign_forward_rejected_for_text_layers_too(model_setup):
+    model, calls = model_setup
+    layer = model.backbone.model.language_model.layers[3]
+    layer.forward = lambda x: x
+    with pytest.raises(RuntimeError, match='forward'):
+        model_compile.install(model, 'text-layers')
+    with pytest.raises(RuntimeError, match='forward'):
+        model_compile.install(model, 'dit-model+vl+text-layers')
+    assert not calls and not hasattr(model, '_gr00t_optional_compile')
+    layer.forward = types.MethodType(type(layer).forward, layer)
+    model_compile.install(model, 'text-layers')
 
 
 def test_forward_wrapper_blocks_other_scope_installation(model_setup):
@@ -275,3 +297,133 @@ def test_real_text_model_output_capture_cpu(monkeypatch, variant, markers):
         torch.testing.assert_close(left, right)
     assert list(model.state_dict()) == keys
     torch._dynamo.reset()
+
+
+COMBOS = {
+    'dit-model+vl': ({'GR00T_COMPILE_DIT': 'model', 'GR00T_COMPILE_VL': '1'}, 5),
+    'dit-model+vl+text-forwards': ({'GR00T_COMPILE_DIT': 'model', 'GR00T_COMPILE_VL': '1',
+                                    'GR00T_COMPILE_TEXT': 'forwards'}, 21),
+    'dit-blocks+text-layers': ({'GR00T_COMPILE_DIT': 'blocks', 'GR00T_COMPILE_TEXT': 'layers'}, 48),
+    'dit-blocks+vl+text-forwards': ({'GR00T_COMPILE_DIT': 'blocks', 'GR00T_COMPILE_VL': '1',
+                                     'GR00T_COMPILE_TEXT': 'forwards'}, 52),
+}
+
+
+@pytest.mark.parametrize('name', COMBOS)
+def test_stacked_scopes_install_exact_targets(model_setup, name):
+    model, calls = model_setup
+    env, count = COMBOS[name]
+    assert model_compile.resolve_variant(env) == name
+    assert training_runtime.resolve_compile_variant(env) == name
+    scopes = model_compile.resolve_scopes(env)
+    expected = {}
+    if scopes.vl:
+        expected.update({f'action_head.vl_self_attention.transformer_blocks.{i}': 'module'
+                         for i in range(4)})
+    if scopes.dit == 'model':
+        expected['action_head.model'] = 'module'
+    if scopes.dit == 'blocks':
+        expected.update({f'action_head.model.transformer_blocks.{i}': 'module' for i in range(32)})
+    if scopes.text != 'off':
+        expected.update({f'backbone.model.language_model.layers.{i}':
+                         'forward' if scopes.text == 'forwards' else 'module' for i in range(16)})
+    info = model_compile.install(model, scopes)
+    assert len(info['paths']) == count
+    assert info['boundaries'] == expected and info['paths'] == list(expected)
+    assert info['variant'] == name and info['scopes'] == scopes.as_dict()
+    json.dumps(info)
+    module_targets = {id(c[1]) for c in calls if c[0] == 'module'}
+    assert module_targets == {id(model.get_submodule(p)) for p, b in expected.items() if b == 'module'}
+    assert sum(c[0] == 'forward' for c in calls) == (1 if scopes.text == 'forwards' else 0)
+    for path, boundary in expected.items():
+        assert model_compile._callable_present(model.get_submodule(path), boundary)
+    assert model_compile.install(model, name) == info
+
+
+def test_full_stack_is_21_paths_matching_legacy_combination():
+    paths = model_compile.expected_paths(model_compile.CompileScopes('model', True, 'forwards'))
+    assert len(paths) == 21 and len(set(paths)) == 21
+    assert set(paths) == (
+        {'action_head.model'}
+        | {f'action_head.vl_self_attention.transformer_blocks.{i}' for i in range(4)}
+        | {f'backbone.model.language_model.layers.{i}' for i in range(16)})
+
+
+def test_stacked_preflight_failure_does_not_mutate(model_setup):
+    model, calls = model_setup
+    del model.backbone.model.language_model.layers[-1]
+    with pytest.raises(ValueError):
+        model_compile.install(model, 'dit-model+vl+text-forwards')
+    assert calls == [] and not hasattr(model, '_gr00t_optional_compile')
+
+
+@pytest.mark.parametrize('env', [
+    {'GR00T_COMPILE_DIT': 'both'}, {'GR00T_COMPILE_VL': '2'}, {'GR00T_COMPILE_TEXT': 'all'},
+])
+def test_invalid_scope_environment(env):
+    with pytest.raises(ValueError):
+        model_compile.resolve_scopes(env)
+
+
+def test_manifest_round_trip_is_json_serializable(model_setup, tmp_path, monkeypatch):
+    model, _ = model_setup
+    monkeypatch.setenv('RANK', '0')
+    info = model_compile.install(model, 'dit-model+vl+text-forwards')
+    model_compile.write_manifest(tmp_path, info)
+    report = json.loads((tmp_path / 'compilation/rank-00.json').read_text())
+    assert report['variant'] == 'dit-model+vl+text-forwards'
+    assert report['scopes'] == {'dit': 'model', 'vl': '1', 'text': 'forwards'}
+
+
+# Fixed snapshot of the former legacy-CLI combinations (dit, text, vl) -> (path count, forward count).
+LEGACY_SNAPSHOT = {
+    ('model', 'off', False): (1, 0), ('blocks', 'off', False): (32, 0),
+    ('off', 'layers', False): (16, 0), ('off', 'forwards', False): (16, 1),
+    ('off', 'off', True): (4, 0), ('model', 'off', True): (5, 0), ('blocks', 'off', True): (36, 0),
+    ('model', 'layers', False): (17, 0), ('model', 'forwards', False): (17, 1),
+    ('blocks', 'layers', False): (48, 0), ('blocks', 'forwards', False): (48, 1),
+    ('off', 'layers', True): (20, 0), ('off', 'forwards', True): (20, 1),
+    ('model', 'layers', True): (21, 0), ('model', 'forwards', True): (21, 1),
+    ('blocks', 'layers', True): (52, 0), ('blocks', 'forwards', True): (52, 1),
+}
+
+
+@pytest.mark.parametrize('combo', LEGACY_SNAPSHOT)
+def test_scopes_match_former_legacy_combinations(model_setup, combo):
+    dit, text, vl = combo
+    count, forwards = LEGACY_SNAPSHOT[combo]
+    model, calls = model_setup
+    scopes = model_compile.CompileScopes(dit, vl, text)
+    expected = model_compile.expected_boundaries(scopes)
+    assert len(expected) == count and len(set(expected)) == count
+    assert sum(b == 'forward' for b in expected.values()) == (16 if forwards else 0)
+    info = model_compile.install(model, scopes)
+    assert info['paths'] == list(expected)
+    assert sum(c[0] == 'forward' for c in calls) == forwards
+    assert sum(c[0] == 'module' for c in calls) == count - (16 if forwards else 0)
+
+
+@pytest.mark.parametrize('variant', ['off', 'dit-model+vl+text-forwards'])
+def test_experiment_dispatch_calls_only_replacement_installer(monkeypatch, variant):
+    """Run the actual dispatch block of experiment.run without importing heavy dependencies."""
+    import ast
+    from pathlib import Path
+    from unittest.mock import Mock
+
+    repo = Path(__file__).resolve().parents[3]
+    tree = ast.parse((repo / 'gr00t/experiment/experiment.py').read_text())
+    run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run')
+    init = next(n for n in run.body if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == 'compile_info' for t in n.targets))
+    dispatch = run.body[run.body.index(init) + 1]
+    install, write = Mock(return_value={'variant': variant, 'paths': ['p']}), Mock()
+    monkeypatch.setitem(sys.modules, 'gr00t.Replacement.model_compile',
+                        SimpleNamespace(install=install, write_manifest=write))
+    scope = {'compile_variant': variant, 'model': object(), 'output_dir': '/unused'}
+    exec(compile(ast.Module(body=[init, dispatch], type_ignores=[]), '<dispatch>', 'exec'), scope)
+    if variant == 'off':
+        install.assert_not_called()
+        assert scope['compile_info'] == {'variant': 'off', 'paths': []}
+    else:
+        install.assert_called_once_with(scope['model'], variant)
+        write.assert_called_once()

@@ -8,32 +8,6 @@ def resolve_compile_variant(environ=None):
     return resolve_variant(environ)
 
 
-def resolve_legacy_compile_request(training, compile_variant):
-    """Select restored CLI scopes without installing two sets of wrappers."""
-    request = {
-        "blocks": training.compile_dit_blocks,
-        "whole": training.compile_dit_model,
-        "text_layers": training.compile_text_layers,
-        "text_forwards": training.compile_text_layer_forwards,
-        "vl_blocks": training.compile_vl_self_attention_blocks,
-        "mode": training.compile_mode,
-    }
-    if not any(request[key] for key in request if key != "mode"):
-        return None
-    if compile_variant != "off":
-        raise ValueError(
-            "Legacy compile CLI flags cannot be combined with GR00T_COMPILE_VARIANT; "
-            "set GR00T_COMPILE_VARIANT=off or remove the CLI compile flags"
-        )
-    if request["blocks"] and request["whole"]:
-        raise ValueError("--compile-dit-blocks and --compile-dit-model are mutually exclusive")
-    if request["text_layers"] and request["text_forwards"]:
-        raise ValueError(
-            "--compile-text-layers and --compile-text-layer-forwards are mutually exclusive"
-        )
-    return request
-
-
 def resolve_trainer_class(config):
     from gr00t.experiment.trainer import Gr00tTrainer
 

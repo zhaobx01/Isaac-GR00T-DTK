@@ -1,3 +1,4 @@
+import json
 import importlib.util
 import pathlib
 import tempfile
@@ -110,51 +111,74 @@ class BenchmarkTest(unittest.TestCase):
 
     def test_new_compile_cases_reach_training_environment(self):
         from unittest.mock import patch
-        expected = {'combo_obr_dit_vl': 'dit-model-vl'}
+        expected = {'combo_obr_dit_vl': 'dit-model+vl'}
         with patch.object(module, 'free_port', return_value='29599'):
             for case, variant in expected.items():
                 with self.subTest(case=case):
                     self.assertIn(case, module.CASES)
                     env = module.build_env(case)
-                    self.assertEqual(env['GR00T_COMPILE_VARIANT'], variant)
+                    self.assertEqual(module.compile_expectation(env)[0], variant)
+                    self.assertNotIn('GR00T_COMPILE_VARIANT', env)
                     self.assertEqual(env['MAX_STEPS'], '40')
                     self.assertEqual(env['GR00T_VISION_PATCH_EMBED_CHANNELS_LAST'], '1')
 
     def test_obr_combinations_build_expected_commands(self):
         expected = {
-            'combo_obr': ('off', False, False),
-            'combo_obr_dit_vl': ('dit-model-vl', False, False),
-            'combo_obr_dit_vl_text': ('off', True, False),
-            'combo_obr_dit_vl_text_allgather': ('off', True, True),
+            'combo_obr': ('off', False),
+            'combo_obr_dit_vl': ('dit-model+vl', False),
+            'combo_obr_dit_vl_text': ('dit-model+vl+text-forwards', False),
+            'combo_obr_dit_vl_text_allgather': ('dit-model+vl+text-forwards', True),
         }
-        for case, (variant, legacy, gather) in expected.items():
+        for case, (variant, gather) in expected.items():
             with self.subTest(case=case):
                 self.assertIn(case, module.CASES)
                 env = module.build_env(case)
                 for key in ('GR00T_PIXEL_VALUES_BF16', 'GR00T_APEX_FUSED_ADAM',
                             'GR00T_ZERO2_OVERLAP', 'GR00T_ZERO2_REDUCE_SCATTER'):
                     self.assertEqual(env[key], '1')
-                self.assertEqual(env['GR00T_COMPILE_VARIANT'], variant)
+                self.assertEqual(module.compile_expectation(env)[0], variant)
                 self.assertEqual(env['GR00T_ZERO2_ALLGATHER_PIPELINE'], str(int(gather)))
                 cmd = module.build_command(pathlib.Path('/tmp/run'), case=case)
-                for flag in ('--compile-dit-model', '--compile-vl-self-attention-blocks',
-                             '--compile-text-layer-forwards'):
-                    self.assertEqual(flag in cmd, legacy)
+                self.assertFalse([arg for arg in cmd if arg.startswith('--compile-')])
 
-    def test_legacy_compile_validation_rejects_missing_text_paths(self):
+    def test_compile_expectation_matches_replacement_scopes(self):
+        from gr00t.Replacement import model_compile
+        for dit in ('off', 'model', 'blocks'):
+            for vl in ('0', '1'):
+                for text in ('off', 'layers', 'forwards'):
+                    env = {'GR00T_COMPILE_DIT': dit, 'GR00T_COMPILE_VL': vl, 'GR00T_COMPILE_TEXT': text}
+                    scopes = model_compile.resolve_scopes(env)
+                    name, paths = module.compile_expectation(env)
+                    self.assertEqual(name, scopes.name)
+                    self.assertEqual(paths, model_compile.expected_boundaries(scopes))
+                    self.assertEqual(list(paths), model_compile.expected_paths(scopes))
+
+    def test_compile_validation_requires_exact_paths_and_boundaries(self):
         case = 'combo_obr_dit_vl_text'
+        name, paths = module.compile_expectation({**module.DEFAULTS, **module.CASES[case]})
+        self.assertEqual(len(paths), 21)
         with tempfile.TemporaryDirectory() as directory:
             run = pathlib.Path(directory)
             (run / 'train.log').write_text('pixel_values is cast to BF16 in DataLoader workers')
+            (run / 'compilation').mkdir()
             info = {'zero2_allgather_pipeline': False, 'zero2_overlap': True,
-                    'zero2_reduce_scatter': True, 'compile_variant': 'legacy-cli',
+                    'zero2_reduce_scatter': True, 'compile_variant': name,
                     'global_batch_size': 768, 'num_gpus': 8,
-                    'compiled_paths': ['action_head.model'] +
-                        [f'action_head.vl_self_attention.transformer_blocks.{i}' for i in range(4)]}
+                    'compiled_paths': [p for p in paths if not p.startswith('backbone')]}
             records = [{'rank': i, 'run_info': info} for i in range(8)]
             with self.assertRaisesRegex(ValueError, 'compiled paths'):
                 module.validate_run(run, case, records)
-            info['compiled_paths'] += [f'backbone.model.language_model.layers.{i}' for i in range(16)]
+            info['compiled_paths'] = list(paths)
+            with self.assertRaisesRegex(ValueError, 'boundaries'):
+                module.validate_run(run, case, records)
+            for i in range(8):
+                (run / 'compilation' / f'rank-{i:02d}.json').write_text(
+                    json.dumps({'boundaries': {**paths, 'action_head.model': 'forward'}}))
+            with self.assertRaisesRegex(ValueError, 'boundaries'):
+                module.validate_run(run, case, records)
+            for i in range(8):
+                (run / 'compilation' / f'rank-{i:02d}.json').write_text(
+                    json.dumps({'boundaries': paths}))
             module.validate_run(run, case, records)
 
     @staticmethod
@@ -228,16 +252,18 @@ class BenchmarkTest(unittest.TestCase):
 
     def test_combination_cases_are_distinct_and_support_controlled_comparisons(self):
         combinations = {case for case in module.CASES if case.startswith('combo_')}
-        self.assertEqual(combinations, {'combo_obr', 'combo_obr_dit_vl',
+        self.assertEqual(combinations, {'combo_runtime', 'combo_dit', 'combo_text_layers',
+                                        'combo_text_forwards', 'combo_obr', 'combo_obr_dit_vl',
                                         'combo_obr_dit_vl_text', 'combo_obr_dit_vl_text_allgather'})
         envs = {case: module.build_env(case) for case in module.CASES}
         keys = set(module.DEFAULTS)
-        self.assertEqual(len({(tuple(env[k] for k in sorted(keys)), case in module.LEGACY_COMPILE_CASES)
-                              for case, env in envs.items()}), len(envs))
+        self.assertEqual(len({tuple(env[k] for k in sorted(keys)) for env in envs.values()}), len(envs))
         for env in envs.values():
             self.assertEqual(env['GR00T_COMPILE_SEQUENCE_POLICY'], 'pad-156')
         self.assertEqual({k for k in keys if envs['combo_obr'][k] != envs['combo_obr_dit_vl'][k]},
-                         {'GR00T_COMPILE_VARIANT'})
+                         {'GR00T_COMPILE_DIT', 'GR00T_COMPILE_VL'})
+        self.assertEqual({k for k in keys if envs['combo_obr_dit_vl'][k] !=
+                          envs['combo_obr_dit_vl_text'][k]}, {'GR00T_COMPILE_TEXT'})
         self.assertEqual({k for k in keys if envs['combo_obr_dit_vl_text'][k] !=
                           envs['combo_obr_dit_vl_text_allgather'][k]}, {'GR00T_ZERO2_ALLGATHER_PIPELINE'})
 
@@ -262,7 +288,7 @@ class BenchmarkTest(unittest.TestCase):
         self.assertEqual({env['GR00T_COMPILE_SEQUENCE_POLICY']
                           for env in plan['environments'].values()}, {'auto'})
 
-    def test_background_runs_default_then_auto_even_if_first_fails(self):
+    def test_background_runs_once_and_records_failure(self):
         import os
         import subprocess
         import time
@@ -292,22 +318,18 @@ if [ "$mode" = default ]; then exit 1; fi
             result = subprocess.run(['bash', str(shell)], env=env, text=True,
                                     capture_output=True, check=True, timeout=5)
             for _ in range(100):
-                if events.exists() and 'end auto' in events.read_text():
+                if list(root.glob('all-optimizations-*.exit')):
                     break
                 time.sleep(.05)
             else:
-                self.fail('background collection did not complete both runs')
+                self.fail('background collection did not finish')
             lines = events.read_text().splitlines()
             self.assertEqual([line.split()[0:2] for line in lines],
-                             [['begin', 'default'], ['end', 'default'],
-                              ['begin', 'auto'], ['end', 'auto']])
+                             [['begin', 'default'], ['end', 'default']])
             self.assertNotIn('--sequence-policy', lines[0])
-            self.assertIn('--sequence-policy auto', lines[2])
             first_output = lines[0].split('--output ', 1)[1].split()[0]
-            second_output = lines[2].split('--output ', 1)[1].split()[0]
-            self.assertEqual(second_output, first_output + '-auto')
             self.assertIn(first_output, result.stdout)
-            self.assertIn(second_output, result.stdout)
+            self.assertEqual(pathlib.Path(first_output + '.exit').read_text().strip(), '1')
 
     def test_stopping_background_runner_stops_child_and_skips_auto(self):
         import os
@@ -727,5 +749,6 @@ m.main()
             self.assertIn('第 31–40 步', report)
             self.assertIn('768.000', report)
             self.assertIn('第 35 步吞吐量 samples/s', report)
+
 
 if __name__ == '__main__': unittest.main()

@@ -481,60 +481,25 @@ Trace 与搬运统计不等于显存快照；窗口空档与 HTA idle 定义不�
 | Guard 失败 | 当前调用不满足已有图的适用条件，如 shape、dtype 或对象状态变化 | 判断变化是否使已有编译版本失效 |
 | Recompile | 无可复用版本时重新捕获并编译 | 解释首次调用耗时尖峰；命中重编译上限后，相关路径回退到 eager |
 
-启动训练前设置环境变量，`torchrun` 启动的各 rank 会继承：
+通过 `start.sh` 启动时，诊断变量须用 `DIAG_TORCH_LOGS` 传入（`start.sh` 清理后再导出为 `TORCH_LOGS`），各 rank 会继承：
 
 | 环境变量 | 输出与用途 |
 | --- | --- |
-| `TORCH_LOGS="graph_breaks,recompiles"` | 将图断位置、重编译及相关 guard 失败原因写入训练输出；通过 `2>&1 \| tee` 一并保存到 `train.log` |
+| `TORCH_LOGS="graph_breaks,recompiles"`（经 `DIAG_TORCH_LOGS` 传入） | 将图断位置、重编译及相关 guard 失败原因写入训练输出；通过 `2>&1 \| tee` 一并保存到 `train.log` |
 | `TORCH_TRACE=<目录>`（可选） | 保存逐 rank 的结构化编译诊断日志，供后续 tlparse 分析 |
 
-只需文本诊断时设置 `TORCH_LOGS` 即可。下面的 `CAPTURE_TORCH_TRACE` 是示例脚本里的 Bash 变量，不是项目配置接口：默认 `0`，改为 `1` 后额外开启结构化日志。生成 tlparse 报告需要另行调用工具，仅设置 `TORCH_TRACE` 不会自动生成 HTML。
+只需文本诊断时设置 `DIAG_TORCH_LOGS` 即可。`start.sh` 不提供 `TORCH_TRACE` 入口；需要结构化日志时直接调用 `examples/finetune.sh` 并自行设置 `TORCH_TRACE`。生成 tlparse 报告需要另行调用工具，仅设置 `TORCH_TRACE` 不会自动生成 HTML。
 
 #### 5.2.2 完整采集命令
 
-以 5.1.3 为基础，保留 8 卡、全局 batch 32、40 步和每 rank 4 个数据 worker，开启整体 DiT 与 4 个 VL 块编译；关闭 Profiler，独立采集编译诊断，沿用当前缓存配置。
+通过 `start.sh` 启动：保留 8 卡、全局 batch 32、40 步和每 rank 4 个数据 worker，开启整体 DiT 与 4 个 VL 块编译；Profiler 默认关闭，独立采集编译诊断，沿用框架默认缓存。`start.sh` 会清理 `TORCH_LOGS`、`TORCH_TRACE`，诊断日志须通过 `DIAG_TORCH_LOGS` 传入；该脚本不提供 `TORCH_TRACE` 结构化日志入口，需要时请直接调用 `examples/finetune.sh` 并自行设置。
 
 ```bash
 cd /workspace/Isaac-GR00T
-set -o pipefail
-export VLM_MODEL_PATH=/workspace/data/checkpoints/nvidia/Cosmos-Reason2-2B
-export HF_HOME=/workspace/data/cache/huggingface
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-export NUM_GPUS=8 MAX_STEPS=40 GLOBAL_BATCH_SIZE=32 USE_WANDB=0
-export DATALOADER_NUM_WORKERS=4
-export MASTER_PORT=29686
-unset GR00T_DIT_SDPA_MODE VIDEO_DECODER_BACKEND TORCH_COMPILE_DEBUG
-output_dir="/workspace/data/outputs/libero-compile-diagnostics-$(date +%Y%m%d-%H%M%S)-$$"
-mkdir -p "$output_dir"
-export TORCH_LOGS="graph_breaks,recompiles"  # 保存文本诊断日志
-CAPTURE_TORCH_TRACE=0  # 改为 1，额外保存逐 rank 结构化日志
-if [[ "$CAPTURE_TORCH_TRACE" == 1 ]]; then
-  export TORCH_TRACE="$output_dir/torch_trace"
-  mkdir -p "$TORCH_TRACE"
-else
-  unset TORCH_TRACE  # 默认关闭，避免继承之前的采集目录
-fi
-script_args=(
-  --base-model-path /workspace/data/checkpoints/GR00T-N1.7-3B-local-cosmos
-  --dataset-path /workspace/data/libero_10_no_noops_1.0.0_lerobot_h264
-  --embodiment-tag LIBERO_PANDA
-  --output-dir "$output_dir"
-  --save-only-model
-)
-training_args=(
-  --no-compile-dit-blocks
-  --compile-dit-model  # 编译整个动作 DiT
-  --no-compile-text-layers
-  --no-compile-text-layer-forwards
-  --compile-vl-self-attention-blocks  # 编译 4 个 VL 自注意力块
-  --compile-mode default
-  --no-enable-profiling
-  --no-check-numerics
-  --gradient-accumulation-steps 1
-  --save-strategy no
-  --no-save-final-model
-)
-bash examples/finetune.sh "${script_args[@]}" -- "${training_args[@]}" 2>&1 | tee "$output_dir/train.log"
+export GLOBAL_BATCH_SIZE=32 MASTER_PORT=29686
+export GR00T_COMPILE_DIT=model GR00T_COMPILE_VL=1   # 整体 DiT + 4 个 VL 自注意力块
+export DIAG_TORCH_LOGS="graph_breaks,recompiles"    # 保存文本诊断日志
+bash start.sh   # 日志位于数据根目录 logs/ 下 bw1000_gbs32_... 开头的文件，输出位于 outputs/ 同名目录
 ```
 
 #### 5.2.3 输出与分析
@@ -557,7 +522,7 @@ fi
 诊断会增加日志与执行开销，耗时不用于正式测速；40 步为目标步数，实际覆盖以完成步数和日志为准。没有匹配日志不能单独证明完整捕获或全程无重编译。正式测速或另行采集 Profiler 前，清除诊断变量：
 
 ```bash
-unset TORCH_LOGS TORCH_TRACE
+unset DIAG_TORCH_LOGS TORCH_LOGS TORCH_TRACE
 ```
 
 ### 5.3 使用 profile-model 与 HTA 分析
@@ -645,7 +610,7 @@ printf '分析输出：%s\n' "$analysis_dir"
 
 当前启动脚本和实验编排器统一清除 `TORCHINDUCTOR_CACHE_DIR`、`TRITON_CACHE_DIR`，使用框架默认路径并保留缓存以供复用，不再为每轮创建独立编译缓存。缓存命中可减少重复编译，但不能消除输入形状变化等原因触发的重编译。历史结果的原始采集条件以对应归档为准，本次修改不重算历史数据。
 
-> 当前入口：已恢复 `gr00t/experiment/compilation.py`、6.1 的旧 CLI 字段及训练调用链，6.2／6.3 脚本可使用这些参数。环境变量入口 `GR00T_COMPILE_VARIANT` 默认 `off`，支持 `vl`、`dit-model`、`dit-model-vl`、`dit-blocks`、`text-layers`、`text-forwards`；启用旧 CLI 编译项时应将它设为 `off`，两种入口同时启用会报错。两者均保留原视觉 Block 编译。未恢复文本实验的 `use_cache=False` 改动；恢复入口不代表文本编译已重新通过 GPU 验收。批量采集编排脚本（原 `scripts/zero2_comm_experiment/`、`scripts/compile_sequence/`）已随优化结束移除，需要复算时使用各归档内的 `source-snapshot/scripts/`。
+> 当前入口：编译范围只有一个入口，即 `gr00t/Replacement/model_compile.py`，由 `GR00T_COMPILE_DIT/VL/TEXT` 三个环境变量选择并可叠加，默认全部关闭；所有脚本通过 `start.sh` 启动。旧的 `gr00t/experiment/compilation.py`、`--compile-*` 命令行开关和 `GR00T_COMPILE_VARIANT` 已移除，`GR00T_COMPILE_VARIANT` 不再被读取，设置它不会产生任何编译，请改用新变量。两种情形均保留原视觉 Block 编译。未恢复文本实验的 `use_cache=False` 改动；文本编译尚未重新通过 GPU 验收。批量采集编排脚本（原 `scripts/zero2_comm_experiment/`、`scripts/compile_sequence/`）已随优化结束移除，需要复算时使用各归档内的 `source-snapshot/scripts/`。
 
 
 ### 6.1 编译范围与选择
@@ -659,7 +624,7 @@ printf '分析输出：%s\n' "$analysis_dir"
 | `GR00T_COMPILE_VISION_BLOCKS` | `1` | 按视觉 Block 类编译，固定使用 `max-autotune-no-cudagraphs` |
 | `GR00T_FLASH_ATTN_DYNAMO_DISABLE` | `1` | 在 FlashAttention 集成函数外安装 Dynamo disable 包装，并更新仍指向原函数的 FA2/FA3 注册引用 |
 
-两变量仅接受 `0/1`，与 `GR00T_COMPILE_VARIANT` 和旧 CLI 编译参数独立。`GR00T_COMPILE_VARIANT=off` 仅关闭新增 DiT/VL/文本编译；`GR00T_COMPILE_MODE` 不影响基线视觉编译的固定模式。边界隔离不会关闭 FlashAttention，关闭视觉编译也不会关闭 `channels_last_3d` 布局。
+两变量仅接受 `0/1`，与 `GR00T_COMPILE_DIT/VL/TEXT` 独立。三个编译范围变量全部关闭时仅关闭新增 DiT/VL/文本编译；`GR00T_COMPILE_MODE` 不影响基线视觉编译的固定模式。边界隔离不会关闭 FlashAttention，关闭视觉编译也不会关闭 `channels_last_3d` 布局。
 
 ```bash
 # 默认启动：两项均开启，也可显式写出
@@ -675,31 +640,39 @@ GR00T_COMPILE_VISION_BLOCKS=0 GR00T_FLASH_ATTN_DYNAMO_DISABLE=0 bash start.sh
 
 视觉编译会修改类调用，FlashAttention 包装会修改当前进程的函数和注册引用。第一次配置完成后，任何开关变化均须启动新进程；重复安装相同配置保持幂等，新视觉类按同一配置安装。安装前检查所有目标和包装归属；无法确认归属或已有包装被改动时明确报错，不覆盖外来包装。安装中途失败后同样要求重启，不在运行中撤销全局修改。CPU 位置处理、模型权重、精度和 `use_cache` 不由这两个开关改变。
 
-训练会在所有 variant（包括 `off` 和旧 CLI）下单独写出 `compilation/baseline-rank-XX.json`，并在逐步指标的 `run_info.baseline_compile` 中保存请求值与安装状态。推理和直接构造骨干输出同样的安装日志。`installation_only=true` 表示构造时的包装安装记录，不代表目标已编译执行或取得提速。
+训练会在所有编译范围下（包括全部关闭）单独写出 `compilation/baseline-rank-XX.json`，并在逐步指标的 `run_info.baseline_compile` 中保存请求值与安装状态。推理和直接构造骨干输出同样的安装日志。`installation_only=true` 表示构造时的包装安装记录，不代表目标已编译执行或取得提速。
 
 40 步测速脚本在 `DEFAULTS` 中显式将两项设为 `1`，所有 CASE 均继承，未增加关闭对照 CASE。可先使用 `--dry-run` 核对启动配置。本次仅进行 CPU 测试与入口验证，未运行新的八卡性能或训练数值验收。
 
-**Replacement 环境变量入口。** `gr00t/Replacement/model_compile.py` 通过 `GR00T_COMPILE_VARIANT` 选择下列范围，旧 CLI 实现仍单独保留。一次只选择一个值；本次不增加逐块或文本模式的组合值。
+**Replacement 环境变量入口。** `gr00t/Replacement/model_compile.py` 通过三个独立变量选择编译范围，可任意叠加；同一变量的取值互斥，因此 DiT 整体与 DiT 逐块、文本整层与文本 forward 不会同时出现。旧的 `--compile-*` 命令行开关与 `GR00T_COMPILE_VARIANT` 已移除。
 
-| 环境变量值 | 编译范围 | 调用边界 |
-| --- | --- | --- |
-| `off` | 不新增编译包装 | 保留基线视觉 Block 编译 |
-| `vl` | 动作头 VL 自注意力 4 块 | 模块实例 |
-| `dit-model` | 整体动作 DiT | 模块实例 |
-| `dit-model-vl` | 整体动作 DiT + VL 自注意力 4 块 | 模块实例 |
-| `dit-blocks` | 动作 DiT 的 32 块 | 各模块实例 |
-| `text-layers` | 保留的文本 Decoder 16 层 | 各模块实例 |
-| `text-forwards` | 保留的文本 Decoder 16 层的 `forward` | 同一层类型共享编译函数，再分别绑定实例 |
+| 变量 | 取值（默认为第一项） | 编译范围 | 调用边界 |
+| --- | --- | --- | --- |
+| `GR00T_COMPILE_DIT` | `off` | 不编译动作 DiT | — |
+| | `model` | 整体动作 DiT（`action_head.model`） | 模块实例 |
+| | `blocks` | 动作 DiT 的 32 块 | 各模块实例 |
+| `GR00T_COMPILE_VL` | `0` | 不编译 VL 自注意力 | — |
+| | `1` | 动作头 VL 自注意力 4 块 | 模块实例 |
+| `GR00T_COMPILE_TEXT` | `off` | 不编译文本 Decoder | — |
+| | `layers` | 保留的文本 Decoder 16 层 | 各模块实例 |
+| | `forwards` | 保留的文本 Decoder 16 层的 `forward` | 同一层类型共享编译函数，再分别绑定实例 |
+
+三个变量全部为默认值时不新增编译包装，仍保留基线视觉 Block 编译。清单、`compilation/rank-XX.json` 与逐步指标中的 `variant` 为规范化名称（顺序 DiT、VL、文本，以 `+` 连接），例如 `dit-model+vl+text-forwards`（共 21 个目标），同时记录 `scopes`。`start.sh` 的三个变量默认值均为关闭，调用方环境中的同名变量会覆盖它们，`GR00T_COMPILE_MODE` 未设置时使用默认模式。`start.sh` 不再清理终端里残留的其他 `GR00T_*` 变量，启动前请确认环境干净。
+
+**诊断与缓存的传入方式。** `start.sh` 和 `benchmark.py` 会清理 `TORCH_LOGS`、`TORCH_TRACE`，`start.sh` 与 `examples/finetune.sh` 还会清理 `TORCHINDUCTOR_CACHE_DIR`、`TRITON_CACHE_DIR`，因此直接在终端设置这些变量不会生效。需要重编译原因和图断位置时，用 `DIAG_TORCH_LOGS=recompiles,graph_breaks bash start.sh`，`start.sh` 清理后再导出为 `TORCH_LOGS`；`benchmark.py` 为保证测速条件不支持诊断日志。这两个脚本不提供隔离缓存目录的入口，冷启动对比需要自行清空框架默认缓存。`recompile_limit` 之类的默认警告不依赖 `TORCH_LOGS`，仍会出现在 `train.log` 中。
 
 ```bash
-GR00T_COMPILE_VARIANT=dit-blocks bash start.sh    # DiT 逐块
-GR00T_COMPILE_VARIANT=text-layers bash start.sh   # 文本完整层
-GR00T_COMPILE_VARIANT=text-forwards bash start.sh # 文本 forward
+GR00T_COMPILE_DIT=blocks bash start.sh                                   # DiT 逐块
+GR00T_COMPILE_TEXT=layers bash start.sh                                  # 文本完整层
+GR00T_COMPILE_DIT=model GR00T_COMPILE_VL=1 bash start.sh                 # 整体 DiT + VL
+GR00T_COMPILE_DIT=model GR00T_COMPILE_VL=1 GR00T_COMPILE_TEXT=forwards bash start.sh  # 三者叠加
 ```
 
-`GR00T_COMPILE_MODE` 默认 `default`，可设置为当前 Inductor 支持的其他模式。切换范围、模式或关闭已安装包装都需要启动新进程；安装失败后不得复用该模型。安装前检查全部目标的数量、类型和已有包装，校验失败不修改模型。两种文本模式均不修改 `use_cache`、精度或冻结状态。`text-layers` 可能把 Transformers 隐藏状态捕获包装纳入编译，在真实训练中可能命中重编译上限并发生框架回退；`text-forwards` 将该捕获逻辑保留在外层 eager，但仍不保证所有输入均能复用同一张图。
+旧变量 `GR00T_COMPILE_VARIANT` 已移除且不再被读取（设置后不会报错，也不会编译），对应关系为：`vl` → `GR00T_COMPILE_VL=1`；`dit-model` → `GR00T_COMPILE_DIT=model`；`dit-model-vl` → 两者同时设置；`dit-blocks` → `GR00T_COMPILE_DIT=blocks`；`text-layers`／`text-forwards` → `GR00T_COMPILE_TEXT=layers`／`forwards`。
 
-文本 `forward` 采用运行时绑定，不能依赖对整个模型对象做 pickle；应保存 `state_dict`，在新建模型加载后重新安装编译。Transformers 输出捕获若异常退出，也应丢弃该模型并启动新进程。序列补齐与长度诊断仍仅允许原有 `dit-model-vl` 范围。
+`GR00T_COMPILE_MODE` 默认 `max-autotune-no-cudagraphs`，可设置为当前 Inductor 支持的其他模式。切换范围、模式或关闭已安装包装都需要启动新进程；安装失败后不得复用该模型。安装前检查全部目标的数量、类型和已有包装，校验失败不修改模型。两种文本模式均不修改 `use_cache`、精度或冻结状态。`text-layers` 可能把 Transformers 隐藏状态捕获包装纳入编译，在真实训练中可能命中重编译上限并发生框架回退；`text-forwards` 将该捕获逻辑保留在外层 eager，但仍不保证所有输入均能复用同一张图。
+
+文本 `forward` 采用运行时绑定，不能依赖对整个模型对象做 pickle；应保存 `state_dict`，在新建模型加载后重新安装编译。Transformers 输出捕获若异常退出，也应丢弃该模型并启动新进程。动态分桶与长度诊断仅允许 `vl`、`dit-model`、`dit-model+vl` 三种范围，含文本编译或 DiT 逐块时会报错。
 
 每 rank 的 `compilation/rank-XX.json` 保留 `paths`，新增 `boundaries` 记录每个目标的 `module` 或 `forward` 边界。`installation_only=true` 仅说明安装包装；训练结束的 `compiled_callables_present` 检查对应边界的包装是否仍存在，图与 kernel 计数属于整个进程（含基线视觉编译），不能据此断言某一目标成功编译或获得提速。`GR00T_COMPILE_TRACE_MARKERS=1` 可对两种边界分别增加 `gr00t_compile::<path>` 标注。
 
@@ -713,44 +686,41 @@ python3 /workspace/scripts/benchmark_all/benchmark.py \
 
 默认每项两轮、每轮 40 步；第 35 步和第 31–40 步平均耗时分别输出对比表，沿用脚本原有有效性规则；每轮启动前每 10 秒检查八卡，仅在每张卡显存利用率均低于 2% 时放行。等待期间打印八卡平均已用显存、平均显存利用率及平均 GPU 利用率，GPU 利用率不参与启动判断。若全部 CASE 启用，共 15 项、30 次训练。编译模式沿用脚本默认设置；框架默认磁盘缓存跨轮保留。该入口提供测速条件，不等于已完成新增模式的设备性能或训练数值验收。
 
-**原 CLI 入口及历史实验脚本：** 下表的 `VARIANT` 是示例脚本变量，与上述环境变量值分别解释。
+**脚本中的方案名。** 6.2、6.3 的示例脚本用 `VARIANT` 选择方案，它只是 Bash 变量，Python 训练入口不会读取，脚本把它映射为编译范围环境变量后交给 `start.sh`：
 
-| VARIANT | 开关 | 编译目标 | 可用示例 |
+| VARIANT | 环境变量 | 编译目标 | 可用示例 |
 | --- | --- | --- | --- |
-| `baseline` | 新增编译开关均关闭 | 保留已有视觉 Block 编译，作为测速对照 | 仅 6.3 |
-| `blocks` | `--compile-dit-blocks` | 动作 DiT 的 32 块，逐实例编译 | 6.2、6.3 |
-| `model` | `--compile-dit-model` | 整个动作 DiT（`action_head.model`）作为一个区域；与 blocks 互斥 | 6.2、6.3 |
-| `model_vl` | `--compile-dit-model` + `--compile-vl-self-attention-blocks` | 同时编译整个动作 DiT 与视觉语言自注意力的 4 块；组合方案 | 6.3 |
-| `text_v2` | `--compile-text-layer-forwards` | 文本 Decoder 16 层的 `forward`；编译边界在隐藏状态收集包装之内 | 6.2、6.3 |
-| `vl` | `--compile-vl-self-attention-blocks` | 视觉语言自注意力的 4 块 | 6.2、6.3 |
-| 历史方案 | `--compile-text-layers` | 旧文本层编译路径；真实训练触发重编译上限，与 `text_v2` 互斥 | 不在当前 VARIANT 列表 |
-| 通用参数 | `--compile-mode default` | 编译模式，不代表独立编译范围 | 6.2、6.3 |
+| `baseline` | 三个变量均为默认 | 保留已有视觉 Block 编译，作为测速对照 | 仅 6.3 |
+| `blocks` | `GR00T_COMPILE_DIT=blocks` | 动作 DiT 的 32 块，逐实例编译 | 6.2、6.3 |
+| `model` | `GR00T_COMPILE_DIT=model` | 整个动作 DiT（`action_head.model`）作为一个区域；与 blocks 互斥 | 6.2、6.3 |
+| `model_vl` | `GR00T_COMPILE_DIT=model GR00T_COMPILE_VL=1` | 同时编译整个动作 DiT 与视觉语言自注意力的 4 块；组合方案 | 6.3 |
+| `text_v2` | `GR00T_COMPILE_TEXT=forwards` | 文本 Decoder 16 层的 `forward`；编译边界在隐藏状态收集包装之内 | 6.2、6.3 |
+| `text_layers` | `GR00T_COMPILE_TEXT=layers` | 文本 Decoder 16 层按模块编译；真实训练触发重编译上限，与 `text_v2` 互斥 | 仅 6.2 |
+| `vl` | `GR00T_COMPILE_VL=1` | 视觉语言自注意力的 4 块 | 6.2、6.3 |
+| 通用参数 | `GR00T_COMPILE_MODE`（默认 `max-autotune-no-cudagraphs`） | 编译模式，不代表独立编译范围 | 6.2、6.3 |
 
-本节脚本按 `VARIANT` 选择单项方案；`model_vl` 是整体 DiT 与 VL 自注意力的组合测速，不能单独归因任一项的收益。训练入口参数放在 `examples/finetune.sh` 的 `--` 之后。编译开关与 HIP 自动 math、数值检查互相独立。关闭某项时，在新进程中移除对应开关或传入 `--no-...`；编译安装或首次执行失败会直接报错，不会静默回退。
+`model_vl` 是整体 DiT 与 VL 自注意力的组合测速，不能单独归因任一项的收益。编译开关与 HIP 自动 math、数值检查互相独立。关闭某项时在新进程中去掉对应变量；编译安装或首次执行失败会直接报错，不会静默回退。
 
-`--compile-text-layer-forwards` 通过 Transformers 调用期间替换并在正常返回后恢复各层实例的 `forward`。若执行中抛出异常，不要继续复用该模型；保存时使用 `state_dict`，并在新实例上重新安装编译。
+文本 `forwards` 通过 Transformers 调用期间替换并在正常返回后恢复各层实例的 `forward`。若执行中抛出异常，不要继续复用该模型；保存时使用 `state_dict`，并在新实例上重新安装编译。
 
-**选择方案：** 在同一 Bash 会话中设置 `VARIANT`，再运行对应小节的完整脚本。例如：
+**基于 `start.sh` 的启动方式。** `start.sh` 固定 8 卡、`MAX_STEPS=40`、`GLOBAL_BATCH_SIZE` 默认 768，默认开启逐步指标，关闭数值检查、模型保存和 Profiler。需要不同设置时：`GLOBAL_BATCH_SIZE` 可由环境覆盖；其他训练参数追加在 `bash start.sh` 之后，会覆盖前面的默认值（如 `--max-steps 80`、`--check-numerics`、`--save-final-model`）。
 
 ```bash
 VARIANT=text_v2  # 本次只启用文本 Decoder 16 层 forward 编译
 ```
 
-切换方案时重新设置 `VARIANT` 并启动新进程。编译参数的传递与生效路径如下：
+切换方案时重新设置并启动新进程。参数的传递与生效路径如下：
 
 ```text
-命令行参数
-→ finetune.sh 解析自身参数，并透传 -- 后的训练参数
-→ launch_finetune.py 用 Tyro 解析为 FinetuneConfig
-   （未传对应编译开关时，使用 finetune_config.py 中该字段的默认值）
-→ launch_finetune.py 创建 base_config.Config
-   └─ training_config.py 提供 Config.training 的初始默认值
-→ launch_finetune.py 将 FinetuneConfig 的编译值写入 Config.training，覆盖初始值
-→ experiment.py 构建模型、安装编译包装并启动训练
+环境变量 GR00T_COMPILE_DIT/VL/TEXT/MODE
+→ start.sh 保留调用方的值（未设置则默认关闭），并把 bash start.sh 之后的参数追加到训练参数
+→ examples/finetune.sh 解析自身参数，并透传 -- 后的训练参数
+→ launch_finetune.py 用 Tyro 解析为 FinetuneConfig（后出现的同名参数覆盖先出现的）
+→ experiment.py 的 run 读取环境变量，调用 model_compile.install 安装编译包装并启动训练
 → 首次执行对应模块时，torch.compile 才进行捕获和编译
 ```
 
-在本节脚本中，`VARIANT` 由 Bash 用来选择要传入的编译开关；Python 训练入口接收的是该开关，不会直接读取 `VARIANT`。因此 `training_config.py` 的默认值在标准微调启动中会被 `FinetuneConfig` 的值覆盖。
+编译范围不经过 `FinetuneConfig`/`TrainingConfig`，命令行上没有对应的 `--compile-*` 参数。
 
 ### 6.2 功能与数值检查
 
@@ -759,88 +729,55 @@ VARIANT=text_v2  # 本次只启用文本 Decoder 16 层 forward 编译
 ```bash
 set -euo pipefail
 cd /workspace/Isaac-GR00T
-VARIANT="${VARIANT:-blocks}"  # blocks | model | text_v2 | vl
+VARIANT="${VARIANT:-blocks}"  # blocks | model | text_v2 | text_layers | vl
 case "$VARIANT" in
-  blocks)     compile_args=(--compile-dit-blocks) ;;
-  model)      compile_args=(--compile-dit-model) ;;
-  text_v2)    compile_args=(--compile-text-layer-forwards) ;;
-  vl)         compile_args=(--compile-vl-self-attention-blocks) ;;
+  blocks)      export GR00T_COMPILE_DIT=blocks ;;
+  model)       export GR00T_COMPILE_DIT=model ;;
+  text_v2)     export GR00T_COMPILE_TEXT=forwards ;;
+  text_layers) export GR00T_COMPILE_TEXT=layers ;;
+  vl)          export GR00T_COMPILE_VL=1 ;;
   *) echo "Unknown VARIANT: $VARIANT" >&2; exit 1 ;;
 esac
-export VLM_MODEL_PATH=/workspace/data/checkpoints/nvidia/Cosmos-Reason2-2B
-export HF_HOME=/workspace/data/cache/huggingface
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-export NUM_GPUS=8 MAX_STEPS=20 GLOBAL_BATCH_SIZE=32 USE_WANDB=0
-export DATALOADER_NUM_WORKERS=4 MASTER_PORT=29687
-export TORCH_LOGS=recompiles,graph_breaks  # 记录重编译原因与图断位置
-unset GR00T_DIT_SDPA_MODE VIDEO_DECODER_BACKEND
-output_dir="/workspace/data/outputs/compile-check-$VARIANT-$(date +%Y%m%d-%H%M%S)-$$"
-mkdir -p "$output_dir"
-unset TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR  # 复用框架默认编译缓存
-script_args=(
-  --base-model-path /workspace/data/checkpoints/GR00T-N1.7-3B-local-cosmos
-  --dataset-path /workspace/data/libero_10_no_noops_1.0.0_lerobot_h264
-  --embodiment-tag LIBERO_PANDA
-  --output-dir "$output_dir"
-  --save-only-model
-)
-training_args=(
-  "${compile_args[@]}" --compile-mode default
-  --check-numerics --gradient-accumulation-steps 1
-  --save-strategy no --save-final-model
-)
-bash examples/finetune.sh "${script_args[@]}" -- "${training_args[@]}" 2>&1 | tee "$output_dir/train.log"
-if grep -Eq 'hit config\.(accumulated_)?recompile_limit' "$output_dir/train.log"; then
-  echo "触发重编译上限，部分模块已回退 eager：$output_dir/train.log" >&2
+export GLOBAL_BATCH_SIZE=32 MASTER_PORT=29687
+export DIAG_TORCH_LOGS=recompiles,graph_breaks  # start.sh 清理 TORCH_LOGS 后再导出，记录重编译原因与图断位置
+# start.sh 默认 40 步、关闭数值检查与模型保存；后附参数覆盖为 20 步、数值检查并保存一次
+bash start.sh --max-steps 20 --check-numerics --save-final-model
+# 日志与输出位于 $GROOT_DATA_ROOT（默认 /workspace/data）的 logs/ 与 outputs/，名称以 bw1000_gbs32_... 开头
+log="$(ls -t "${GROOT_DATA_ROOT:-/workspace/data}"/logs/bw1000_gbs32_*.log | head -1)"
+if grep -Eq 'hit config\.(accumulated_)?recompile_limit' "$log"; then
+  echo "触发重编译上限，部分模块已回退 eager：$log" >&2
   exit 1
 fi
 ```
 
 ### 6.3 编译测速对照
 
-**用途：比较短程吞吐，不验证数值正确性。** 按 [Baseline 采集口径](optimization/groot_dtk_optimization_record.md#52-采集方法)运行 8 卡、全局 batch 32、每方案 80 步 × 3 轮；每轮独立进程，复用框架默认 Inductor/Triton 缓存，关闭 Profiler、数值检查和图断日志，不保存模型。建议先测 `VARIANT=baseline`，再测单项编译方案；也可用 `VARIANT=model_vl` 同时测试整体 DiT 与 VL 编译。组合结果不能替代两个单项结果，且不应据此拆分各自收益。尽量保持机器与时段一致。以下实测汇总仅作参考。
+**用途：比较短程吞吐，不验证数值正确性。** 按 [Baseline 采集口径](optimization/groot_dtk_optimization_record.md#52-采集方法)运行 8 卡、全局 batch 32、每方案 80 步 × 3 轮；每轮独立进程，复用框架默认 Inductor/Triton 缓存，关闭 Profiler、数值检查和图断日志（不设置 `DIAG_TORCH_LOGS`），不保存模型。建议先测 `VARIANT=baseline`，再测单项编译方案；也可用 `VARIANT=model_vl` 同时测试整体 DiT 与 VL 编译。脚本经 `start.sh` 启动，其日志另存于数据根目录的 `logs/`。组合结果不能替代两个单项结果，且不应据此拆分各自收益。尽量保持机器与时段一致。以下实测汇总仅作参考。
 
 ```bash
 set -euo pipefail
 cd /workspace/Isaac-GR00T
 VARIANT="${VARIANT:-blocks}"  # baseline | blocks | model | model_vl | text_v2 | vl
-export GR00T_COMPILE_VARIANT=off  # 使用旧 CLI 入口，避免与环境变量入口冲突
 case "$VARIANT" in
-  baseline) compile_args=(--no-compile-dit-blocks --no-compile-dit-model
-                          --no-compile-text-layers --no-compile-text-layer-forwards
-                          --no-compile-vl-self-attention-blocks) ;;
-  blocks)   compile_args=(--compile-dit-blocks) ;;
-  model)    compile_args=(--compile-dit-model) ;;
-  model_vl) compile_args=(--compile-dit-model --compile-vl-self-attention-blocks) ;;
-  text_v2)  compile_args=(--compile-text-layer-forwards) ;;
-  vl)       compile_args=(--compile-vl-self-attention-blocks) ;;
+  baseline) ;;
+  blocks)   export GR00T_COMPILE_DIT=blocks ;;
+  model)    export GR00T_COMPILE_DIT=model ;;
+  model_vl) export GR00T_COMPILE_DIT=model GR00T_COMPILE_VL=1 ;;
+  text_v2)  export GR00T_COMPILE_TEXT=forwards ;;
+  vl)       export GR00T_COMPILE_VL=1 ;;
   *) echo "Unknown VARIANT: $VARIANT" >&2; exit 1 ;;
 esac
-export VLM_MODEL_PATH=/workspace/data/checkpoints/nvidia/Cosmos-Reason2-2B
-export HF_HOME=/workspace/data/cache/huggingface
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-export NUM_GPUS=8 MAX_STEPS=80 GLOBAL_BATCH_SIZE=32 USE_WANDB=0
-export DATALOADER_NUM_WORKERS=4
-unset GR00T_DIT_SDPA_MODE VIDEO_DECODER_BACKEND TORCH_LOGS TORCH_COMPILE_DEBUG
-root="/workspace/data/outputs/compile-bench-$VARIANT-$(date +%Y%m%d-%H%M%S)-$$"
+export GLOBAL_BATCH_SIZE=32
+data_root="${GROOT_DATA_ROOT:-/workspace/data}"
+root="$data_root/outputs/compile-bench-$VARIANT-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$root"
 for round in 1 2 3; do
-  output_dir="$root/speed-r$round"
-  mkdir "$output_dir"
-  unset TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR  # 复用框架默认编译缓存
   export MASTER_PORT=$((29690 + round))
-  script_args=(
-    --base-model-path /workspace/data/checkpoints/GR00T-N1.7-3B-local-cosmos
-    --dataset-path /workspace/data/libero_10_no_noops_1.0.0_lerobot_h264
-    --embodiment-tag LIBERO_PANDA
-    --output-dir "$output_dir"
-  )
-  training_args=(
-    "${compile_args[@]}" --compile-mode default
-    --no-check-numerics --log-step-metrics --gradient-accumulation-steps 1
-    --save-strategy no --no-save-final-model
-  )
-  bash examples/finetune.sh "${script_args[@]}" -- "${training_args[@]}" 2>&1 | tee "$output_dir/train.log"
+  # start.sh 默认关闭数值检查、Profiler、模型保存，开启逐步指标，复用框架默认编译缓存，并清理 TORCH_LOGS
+  bash start.sh --max-steps 80
+  # 最新一次输出目录移入本轮目录，便于下方汇总脚本按 speed-r* 读取
+  latest="$(ls -dt "$data_root"/outputs/bw1000_gbs32_* | head -1)"
+  mv "$latest" "$root/speed-r$round"
 done
 printf 'Results: %s\n' "$root"
 ```
@@ -884,10 +821,10 @@ EOF
 当前启停方式（新进程生效）：
 
 ```bash
-export GR00T_COMPILE_VARIANT=vl           # VL
-export GR00T_COMPILE_VARIANT=dit-model    # 整体DiT
-export GR00T_COMPILE_VARIANT=dit-model-vl # 组合
-export GR00T_COMPILE_VARIANT=off          # 关闭新增编译，保留原视觉Block编译
+GR00T_COMPILE_VL=1 bash start.sh                          # VL
+GR00T_COMPILE_DIT=model bash start.sh                     # 整体DiT
+GR00T_COMPILE_DIT=model GR00T_COMPILE_VL=1 bash start.sh  # 组合
+bash start.sh                                             # 三个变量均为默认：关闭新增编译，保留原视觉Block编译
 ```
 
 **以下为历史 batch 32 数据，与本批分开阅读。** 8 卡、全局 batch 32；统一统计第 71–80 步，每轮吞吐按 `32 × 10 / max_rank(sum(step_seconds[70:80]))` 计算，再取三轮中位数。基线使用 reference 的三轮数据，与编译实验来自不同批次。
@@ -952,7 +889,7 @@ export GR00T_COMPILE_SEQUENCE_POLICY=pad-156      # 单桶
 export GR00T_COMPILE_SEQUENCE_POLICY=auto         # 回退原补齐，默认
 ```
 
-**与编译项的组合范围。** 两种补齐策略在训练器输入处补齐 `input_ids` 和 `attention_mask`，不依赖编译产物，可与任意 `GR00T_COMPILE_VARIANT`（含 `off`）及旧 CLI 编译项组合。`GR00T_COMPILE_SEQUENCE_POLICY=dynamic-buckets` 和 `GR00T_COMPILE_LENGTH_DIAGNOSTICS=1` 需要包装已编译的 VL／DiT 可调用对象，仅支持 `vl`、`dit-model`、`dit-model-vl`，不支持旧 CLI、`dit-blocks`、`text-layers`、`text-forwards` 和 `off`，配置不符时启动即报错。只开 `vl` 或 `dit-model` 时，分桶配置须包含对应目标（`vl`／`dit`）。补齐与 `dit-blocks`、`text-*` 的组合尚未做 GPU 测速，补齐的数值等价性也未验证。
+**与编译项的组合范围。** 两种补齐策略在训练器输入处补齐 `input_ids` 和 `attention_mask`，不依赖编译产物，可与任意编译范围（含全部关闭）组合。`GR00T_COMPILE_SEQUENCE_POLICY=dynamic-buckets` 和 `GR00T_COMPILE_LENGTH_DIAGNOSTICS=1` 需要包装已编译的 VL／DiT 可调用对象，仅支持仅 VL（`GR00T_COMPILE_VL=1`）、仅整体 DiT（`GR00T_COMPILE_DIT=model`）或两者同时开启，不支持 `GR00T_COMPILE_DIT=blocks`、任何 `GR00T_COMPILE_TEXT` 取值和全部关闭，配置不符时启动即报错。只开 VL 或整体 DiT 时，分桶配置须包含对应目标（`vl`／`dit`）。补齐与逐块 DiT、文本编译的组合尚未做 GPU 测速，补齐的数值等价性也未验证。
 
 #### 6.5.4 实验结果
 
@@ -1105,7 +1042,7 @@ export GR00T_ZERO2_OVERLAP=0
 export GR00T_ZERO2_REDUCE_SCATTER=0
 export GR00T_ZERO2_ALLGATHER_PIPELINE=0
 export GR00T_ZERO2_PACK_TIMING=0
-export GR00T_COMPILE_VARIANT=off
+export GR00T_COMPILE_DIT=off GR00T_COMPILE_VL=0 GR00T_COMPILE_TEXT=off
 unset GR00T_DEEPSPEED_CONFIG_PATH GPU_MAX_HW_QUEUES
 ```
 
@@ -1429,6 +1366,51 @@ BASE、8 卡、全局 batch 768、每卡 96、BF16、ZeRO-2。`GR00T_PIXEL_VALUE
    '
    ```
    抓取的是训练实际调用的 GEMM size，作为选优工具的输入。`capture` 只保存原始日志；日志清理去重、改配置都由下一步 `run` 自动完成。
+
+   **组合优化配置采集（可选）**：以下单独采集 `benchmark.py` 的 `combo_obr_dit_vl_text_allgather`，保留上面的基线日志。训练配置与该 case 对齐，采集步数从 40 步缩短为 5 步；先确认 8 卡和端口空闲，环境中已安装组合配置所需依赖。
+
+   ```bash
+   cd /workspace/Isaac-GR00T/getting_started/optimization
+   ./dcu_gemm_autotune.sh capture --layer 3 --out /tmp/train_layer3_combo.log -- bash -c '
+     set -e
+     cd /workspace/Isaac-GR00T
+
+     # 与 benchmark.py 一样清理继承的 GR00T 开关和编译诊断变量。
+     while IFS= read -r name; do unset "$name"; done < <(compgen -e | grep "^GR00T_" || true)
+     unset TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR TORCH_LOGS TORCH_TRACE CUDA_LAUNCH_BLOCKING HIP_LAUNCH_BLOCKING
+
+     export NUM_GPUS=8 GLOBAL_BATCH_SIZE=768 MAX_STEPS=5 DATALOADER_NUM_WORKERS=4
+     export USE_WANDB=0 MASTER_PORT=29517
+     export VLM_MODEL_PATH=/workspace/data/checkpoints/nvidia/Cosmos-Reason2-2B
+     export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+     export BASE_MODEL=/workspace/data/checkpoints/GR00T-N1.7-3B-local-cosmos
+     export DATASET=/workspace/data/libero_10_no_noops_1.0.0_lerobot_h264
+
+     export GR00T_COMPILE_VISION_BLOCKS=1 GR00T_FLASH_ATTN_DYNAMO_DISABLE=1
+     export GR00T_VISION_PATCH_EMBED_CHANNELS_LAST=1 GR00T_COMPILE_SEQUENCE_POLICY=pad-156
+     export GR00T_PIXEL_VALUES_BF16=1 GR00T_APEX_FUSED_ADAM=1
+     export GR00T_ZERO2_OVERLAP=1 GR00T_ZERO2_REDUCE_SCATTER=1
+     export GR00T_ZERO2_ALLGATHER_PIPELINE=1 GR00T_ZERO2_PACK_TIMING=0
+     export GR00T_COMPILE_DIT=model GR00T_COMPILE_VL=1 GR00T_COMPILE_TEXT=forwards
+
+     bash examples/finetune.sh \
+         --base-model-path "$BASE_MODEL" \
+         --dataset-path "$DATASET" \
+         --embodiment-tag LIBERO_PANDA \
+         --output-dir /tmp/capture_combo_out \
+         --state-dropout-prob 0.2 \
+         --save-only-model \
+         -- \
+         --gradient-accumulation-steps 1 \
+         --log-step-metrics \
+         --save-strategy no \
+         --no-save-final-model \
+         --no-check-numerics \
+         --no-enable-profiling
+   '
+   ```
+
+   `capture` 在训练失败时仍会打印完成提示；继续前应确认日志中的 `Training completed!`、检查是否有错误，并确认 `grep -c "^\./rocblas-bench" /tmp/train_layer3_combo.log` 大于 0。五步仅覆盖本次观察到的调用；编译内核等未经过 rocBLAS 的 GEMM 不一定出现在日志中。分别选优时，将下一步的 `--input` 改为 `/tmp/train_layer3_combo.log`；每次全新选优会清理旧产物，需先备份要保留的结果。
 3. **全流程选优（以 Layer3 日志输入、8 卡并行）**：
    ```bash
    # 使用真实 Layer3 日志、8 卡并行选优

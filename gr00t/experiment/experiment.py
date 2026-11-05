@@ -199,7 +199,6 @@ def run(config: Config):
     from gr00t.experiment.training_runtime import (
         resolve_trainer_class,
         resolve_compile_variant,
-        resolve_legacy_compile_request,
         resolve_zero2_comm_switches,
         resolve_zero2_pack_timing,
     )
@@ -209,11 +208,10 @@ def run(config: Config):
     config.training.optim = resolve_optimizer(config.training.optim)
     trainer_class = resolve_trainer_class(config)
     compile_variant = resolve_compile_variant()
-    legacy_compile_request = resolve_legacy_compile_request(config.training, compile_variant)
     from gr00t.Replacement.sequence_buckets import load_buckets, resolve_policy, validate_activation
 
     sequence_policy, sequence_bucket_path, sequence_diagnostics = resolve_policy()
-    validate_activation(sequence_policy, sequence_diagnostics, compile_variant, legacy_compile_request)
+    validate_activation(sequence_policy, sequence_diagnostics, compile_variant)
     sequence_buckets = load_buckets(sequence_bucket_path) if sequence_policy == "dynamic-buckets" else None
     zero2_overlap, zero2_reduce_scatter = resolve_zero2_comm_switches()
     if zero2_overlap or zero2_reduce_scatter:
@@ -288,14 +286,7 @@ def run(config: Config):
     })
     write_baseline_manifest(output_dir, baseline_compile_info)
     compile_info = {"variant": compile_variant, "paths": []}
-    if legacy_compile_request is not None:
-        from gr00t.experiment.compilation import install_model_compile
-
-        compiled_paths = install_model_compile(model, **legacy_compile_request)
-        compile_info = {
-            "variant": "legacy-cli", "paths": compiled_paths, "request": legacy_compile_request
-        }
-    elif compile_variant != "off":
+    if compile_variant != "off":
         from gr00t.Replacement.model_compile import install, write_manifest
 
         compile_info = install(model, compile_variant)
@@ -434,7 +425,6 @@ def run(config: Config):
                     "zero2_reduce_scatter": zero2_reduce_scatter,
                     "compile_variant": compile_info["variant"],
                     "compiled_paths": compile_info["paths"],
-                    "legacy_compile_request": legacy_compile_request,
                     "baseline_compile": baseline_compile_info,
                     "global_batch_size": config.training.global_batch_size,
                     "num_gpus": config.training.num_gpus,
@@ -483,7 +473,9 @@ def run(config: Config):
                                               physical_device=physical)
                 sequence_trainer_diagnostics = TrainerDiagnostics(trainer, recorder)
                 sequence_trainer_diagnostics.install()
-            targets = [("dit" if path == "action_head.model" else "vl", model.get_submodule(path), path)
+            from gr00t.Replacement.sequence_buckets import adapter_kind
+
+            targets = [(adapter_kind(path), model.get_submodule(path), path)
                        for path in compile_info["paths"]]
             sequence_adapter = SequenceAdapter(targets, sequence_buckets, recorder=recorder)
             sequence_adapter.__enter__()
